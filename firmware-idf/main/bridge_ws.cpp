@@ -16,6 +16,7 @@
 #include "cJSON.h"
 
 #include "lcd.h"
+#include "speaker.h"
 
 static const char *TAG = "bridge_ws";
 
@@ -24,6 +25,8 @@ namespace {
 // Match bridge/protocol.py exactly.
 constexpr uint8_t PROTOCOL_VERSION = 0x02;
 constexpr uint8_t KIND_MIC_PCM     = 0x01;
+constexpr uint8_t KIND_TTS_PCM     = 0x02;
+constexpr uint8_t KIND_TTS_OPUS    = 0x06;
 
 constexpr size_t BINARY_HEADER_LEN = 8;
 // 8 bytes: u8 ver, u8 kind, u16 sid LE, u32 seq LE
@@ -34,6 +37,9 @@ bool g_hello_acked    = false;
 bool g_mic_streaming  = false;
 uint16_t g_mic_sid    = 0;
 uint32_t g_mic_seq    = 0;
+uint16_t g_tts_sid    = 0;
+uint32_t g_tts_seq    = 0;
+bool     g_tts_in_flight = false;
 
 char g_device_id[64]    = {0};
 uint32_t g_boot_count   = 0;
@@ -162,14 +168,65 @@ void on_text(const char *data, size_t len) {
             ESP_LOGI(TAG, "← hello.ack — bridge online (LCD=IDLE)");
         } else if (strcmp(t, "req") == 0) {
             handle_req(root);
+        } else if (strcmp(t, "tts.start") == 0) {
+            const cJSON *sid_j = cJSON_GetObjectItemCaseSensitive(root, "sid");
+            uint16_t sid = cJSON_IsNumber(sid_j) ? (uint16_t)sid_j->valueint : 0;
+            g_tts_sid = sid;
+            g_tts_seq = 0;
+            g_tts_in_flight = true;
+            speaker_play_start(sid);
+            lcd_set_state(LCD_STATE_SPEAKING);
+            ESP_LOGI(TAG, "← tts.start sid=%u (LCD=TALK)", (unsigned)sid);
+        } else if (strcmp(t, "tts.end") == 0) {
+            const cJSON *sid_j = cJSON_GetObjectItemCaseSensitive(root, "sid");
+            uint16_t sid = cJSON_IsNumber(sid_j) ? (uint16_t)sid_j->valueint : g_tts_sid;
+            speaker_play_end(sid);
+            g_tts_in_flight = false;
+            ESP_LOGI(TAG, "← tts.end sid=%u", (unsigned)sid);
         } else if (strcmp(t, "ping") == 0) {
-            // bridge sends ping; reply pong
             send_text("{\"t\":\"pong\",\"ts\":0}");
         } else {
             ESP_LOGD(TAG, "← unhandled text type: %s", t);
         }
     }
     cJSON_Delete(root);
+}
+
+void on_binary(const uint8_t *data, size_t len) {
+    if (len < BINARY_HEADER_LEN) {
+        ESP_LOGW(TAG, "binary frame too short: %u", (unsigned)len);
+        return;
+    }
+    uint8_t ver  = data[0];
+    uint8_t kind = data[1];
+    if (ver != PROTOCOL_VERSION) {
+        ESP_LOGW(TAG, "binary frame ver mismatch: 0x%02x", ver);
+        return;
+    }
+    if (kind != KIND_TTS_PCM && kind != KIND_TTS_OPUS) {
+        ESP_LOGW(TAG, "binary frame unknown kind: 0x%02x", kind);
+        return;
+    }
+    uint32_t seq = (uint32_t)data[4]
+                 | ((uint32_t)data[5] << 8)
+                 | ((uint32_t)data[6] << 16)
+                 | ((uint32_t)data[7] << 24);
+    size_t payload_bytes = len - BINARY_HEADER_LEN;
+    if (payload_bytes < 1) {
+        ESP_LOGW(TAG, "tts pcm bad payload: %u bytes", (unsigned)payload_bytes);
+        return;
+    }
+    if (kind == KIND_TTS_OPUS) {
+        speaker_play_opus(data + BINARY_HEADER_LEN, payload_bytes, (uint16_t)seq);
+    } else {
+        if (payload_bytes < 2 || (payload_bytes & 1)) {
+            ESP_LOGW(TAG, "tts pcm bad payload: %u bytes", (unsigned)payload_bytes);
+            return;
+        }
+        const int16_t *pcm = (const int16_t *)(data + BINARY_HEADER_LEN);
+        size_t n_samples = payload_bytes / sizeof(int16_t);
+        speaker_play_pcm(pcm, n_samples, (uint16_t)seq);
+    }
 }
 
 void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -188,11 +245,35 @@ void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_da
         g_hello_acked   = false;
         g_mic_streaming = false;
         break;
-    case WEBSOCKET_EVENT_DATA:
+    case WEBSOCKET_EVENT_DATA: {
+        // IDF's esp_websocket_client splits a single ws frame into one
+        // event per TCP segment (~1436 bytes), each tagged op_code=0x02
+        // (not continuation 0x00). payload_offset + data_len < payload_len
+        // means there's more coming for this frame. We reassemble here
+        // before handing off to on_binary, which expects a complete frame
+        // with the 8-byte header at offset 0.
+        static uint8_t  reasm[8192];   // covers tts_pcm (1928 B), set_image (large), opus (~70 B)
+        static size_t   reasm_filled = 0;
         if (data->op_code == 0x01 /* text */ && data->data_len > 0) {
             on_text((const char *)data->data_ptr, data->data_len);
+        } else if (data->op_code == 0x02 /* binary */ && data->data_len > 0) {
+            if (data->payload_offset == 0) reasm_filled = 0;
+            if (reasm_filled + data->data_len <= sizeof(reasm)) {
+                memcpy(reasm + reasm_filled, data->data_ptr, data->data_len);
+                reasm_filled += data->data_len;
+            } else {
+                ESP_LOGW(TAG, "ws reasm overflow: filled=%u + %d > %u — frame discarded",
+                         (unsigned)reasm_filled, data->data_len, (unsigned)sizeof(reasm));
+                reasm_filled = 0;
+                break;
+            }
+            if ((int)reasm_filled >= data->payload_len) {
+                on_binary(reasm, reasm_filled);
+                reasm_filled = 0;
+            }
         }
         break;
+    }
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "ws error");
         break;
@@ -221,7 +302,7 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     cfg.uri                       = uri;
     cfg.reconnect_timeout_ms      = 5000;
     cfg.network_timeout_ms        = 10000;
-    cfg.buffer_size               = 4096;
+    cfg.buffer_size               = 16384;   // 8 chunks at 1920 B/each — absorbs bursts
     // Default 4 KB task stack overflows when we mix cJSON + send_bin
     // + event handler in the same task at 31 fps. 8 KB has comfortable
     // margin.
@@ -284,4 +365,14 @@ void bridge_ws_signal_speech_end(const char *reason) {
     ESP_LOGI(TAG, "→ mic.end sid=%u reason=%s sent=%lu frames",
              (unsigned)g_mic_sid, reason ? reason : "vad",
              (unsigned long)g_mic_seq);
+}
+
+void bridge_ws_send_tts_done(uint16_t sid) {
+    if (!bridge_ws_is_connected()) return;
+    char buf[80];
+    snprintf(buf, sizeof(buf),
+             "{\"t\":\"evt\",\"name\":\"tts.done\",\"d\":{\"sid\":%u}}",
+             (unsigned)sid);
+    send_text(buf);
+    ESP_LOGI(TAG, "→ evt tts.done sid=%u", (unsigned)sid);
 }

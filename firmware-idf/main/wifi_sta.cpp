@@ -77,7 +77,20 @@ esp_err_t wifi_sta_connect(const char *ssid, const char *password) {
     ESP_LOGI(TAG, "connecting to '%s'…", ssid);
     EventBits_t bits = xEventGroupWaitBits(
         g_events, BIT_CONNECTED | BIT_FAILED, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
-    if (bits & BIT_CONNECTED) return ESP_OK;
+    if (bits & BIT_CONNECTED) {
+        // Kill modem-sleep so TTS PCM frames don't bunch up waiting for
+        // the next beacon. Costs ~30 mA but eliminates the 100-300 ms
+        // burst-arrival pattern we measured: 4 sec of audio was being
+        // stretched to 26 sec of delivery because the radio was napping
+        // between beacons and the AP queued our small frames.
+        esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+        if (ps_err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(ps_err));
+        } else {
+            ESP_LOGI(TAG, "WiFi power save disabled (low-latency mode)");
+        }
+        return ESP_OK;
+    }
     ESP_LOGE(TAG, "wifi connect failed (bits=0x%lx)", (unsigned long)bits);
     return ESP_FAIL;
 }

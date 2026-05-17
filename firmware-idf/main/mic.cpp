@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_tdm.h"
+#include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 
@@ -32,11 +33,13 @@ constexpr gpio_num_t       I2S_MCLK     = GPIO_NUM_0;
 constexpr gpio_num_t       I2S_BCLK     = GPIO_NUM_34;
 constexpr gpio_num_t       I2S_WS       = GPIO_NUM_33;
 constexpr gpio_num_t       I2S_DIN      = GPIO_NUM_14;
+constexpr gpio_num_t       I2S_DOUT     = GPIO_NUM_13;   // AW88298 speaker data
 
 constexpr uint8_t          ES7210_ADDR  = ES7210_CODEC_DEFAULT_ADDR;
 
 i2c_master_bus_handle_t      g_i2c_bus     = nullptr;  // borrowed, not owned
 i2s_chan_handle_t            g_i2s_rx      = nullptr;
+i2s_chan_handle_t            g_i2s_tx      = nullptr;  // exposed for speaker.cpp
 const audio_codec_data_if_t *g_data_if     = nullptr;
 const audio_codec_ctrl_if_t *g_ctrl_if     = nullptr;
 const audio_codec_if_t      *g_codec_if    = nullptr;
@@ -44,6 +47,9 @@ esp_codec_dev_handle_t       g_codec_dev   = nullptr;
 int                          g_channels    = 1;
 
 }  // namespace
+
+i2s_chan_handle_t mic_get_i2s_tx_handle(void) { return g_i2s_tx; }
+i2s_port_t        mic_get_i2s_port(void)      { return I2S_PORT; }
 
 esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
                     uint32_t sample_rate_hz,
@@ -54,15 +60,18 @@ esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
     }
     g_i2c_bus = i2c_bus;
 
-    // ─── I2S channel — RX only, TDM mode (ES7210 is TDM-only) ──────────
+    // ─── I2S channel — full duplex TDM, RX (mic) + TX (speaker). On
+    // CoreS3 the ES7210 mic and AW88298 amp share BCLK/WS, so they must
+    // live in the same TDM clock domain. ESP-IDF requires same-mode
+    // full-duplex; mixing TDM-RX + STD-TX on one port is not supported.
     {
         i2s_chan_config_t chan_cfg = {};
         chan_cfg.id                  = I2S_PORT;
         chan_cfg.role                = I2S_ROLE_MASTER;
-        chan_cfg.dma_desc_num        = 6;
-        chan_cfg.dma_frame_num       = 240;       // 15 ms @ 16 kHz
+        chan_cfg.dma_desc_num        = 8;
+        chan_cfg.dma_frame_num       = 480;       // 30 ms × 8 = 240 ms cushion @ 16 kHz
         chan_cfg.auto_clear_after_cb = true;
-        esp_err_t err = i2s_new_channel(&chan_cfg, nullptr, &g_i2s_rx);
+        esp_err_t err = i2s_new_channel(&chan_cfg, &g_i2s_tx, &g_i2s_rx);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
             return err;
@@ -92,17 +101,53 @@ esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
         tdm.gpio_cfg.mclk            = I2S_MCLK;
         tdm.gpio_cfg.bclk            = I2S_BCLK;
         tdm.gpio_cfg.ws              = I2S_WS;
-        tdm.gpio_cfg.dout            = I2S_GPIO_UNUSED;
+        tdm.gpio_cfg.dout            = I2S_GPIO_UNUSED;  // TX is STD on a separate init below
         tdm.gpio_cfg.din             = I2S_DIN;
+
+        // TX side runs STD (standard I2S) mode — matches what AW88298
+        // expects when its REG06 boots to 0x3CC8 (BCK 16*2). M5Stack's
+        // official CoreS3 IDF firmware uses the same split-mode duplex.
+        i2s_std_config_t std = {};
+        std.clk_cfg.sample_rate_hz   = sample_rate_hz;
+        std.clk_cfg.clk_src          = I2S_CLK_SRC_DEFAULT;
+        std.clk_cfg.ext_clk_freq_hz  = 0;
+        std.clk_cfg.mclk_multiple    = I2S_MCLK_MULTIPLE_256;
+
+        std.slot_cfg.data_bit_width  = I2S_DATA_BIT_WIDTH_16BIT;
+        std.slot_cfg.slot_bit_width  = I2S_SLOT_BIT_WIDTH_AUTO;
+        std.slot_cfg.slot_mode       = I2S_SLOT_MODE_STEREO;
+        std.slot_cfg.slot_mask       = I2S_STD_SLOT_BOTH;
+        std.slot_cfg.ws_width        = I2S_DATA_BIT_WIDTH_16BIT;
+        std.slot_cfg.ws_pol          = false;
+        std.slot_cfg.bit_shift       = true;
+        std.slot_cfg.left_align      = true;
+        std.slot_cfg.big_endian      = false;
+        std.slot_cfg.bit_order_lsb   = false;
+
+        std.gpio_cfg.mclk            = I2S_MCLK;
+        std.gpio_cfg.bclk            = I2S_BCLK;
+        std.gpio_cfg.ws              = I2S_WS;
+        std.gpio_cfg.dout            = I2S_DOUT;
+        std.gpio_cfg.din             = I2S_GPIO_UNUSED;
 
         err = i2s_channel_init_tdm_mode(g_i2s_rx, &tdm);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2s init_tdm failed: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "i2s init_tdm rx failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = i2s_channel_init_std_mode(g_i2s_tx, &std);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "i2s init_std tx failed: %s", esp_err_to_name(err));
             return err;
         }
         err = i2s_channel_enable(g_i2s_rx);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "i2s_channel_enable rx failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = i2s_channel_enable(g_i2s_tx);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "i2s_channel_enable tx failed: %s", esp_err_to_name(err));
             return err;
         }
     }
@@ -152,14 +197,17 @@ esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
             return ESP_FAIL;
         }
 
-        // Read all 4 TDM slots so the spike can compare them and pick
-        // the right one for VAD. mic_read() (mono) will still hand back
-        // slot 0; mic_read_multi() exposes all channels for inspection.
-        g_channels = 4;
+        // Open as 2-channel (primary mic + AEC reference), matching
+        // M5Stack's official CoreS3 audio codec. Opening as 4-channel
+        // makes esp_codec_dev's I2S data layer reconfigure the shared
+        // TX side into a 64-bit-frame shape that AW88298 can't parse
+        // — that was the root cause of "TX path alive but silent".
+        g_channels = 2;
         esp_codec_dev_sample_info_t fs = {};
         fs.bits_per_sample = 16;
         fs.channel         = g_channels;
-        fs.channel_mask    = (1 << g_channels) - 1;       // all enabled
+        fs.channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) |
+                             ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         fs.sample_rate     = sample_rate_hz;
         esp_err_t err = esp_codec_dev_open(g_codec_dev, &fs);
         if (err != ESP_OK) {
@@ -223,6 +271,11 @@ void mic_deinit(void) {
         i2s_channel_disable(g_i2s_rx);
         i2s_del_channel(g_i2s_rx);
         g_i2s_rx = nullptr;
+    }
+    if (g_i2s_tx) {
+        i2s_channel_disable(g_i2s_tx);
+        i2s_del_channel(g_i2s_tx);
+        g_i2s_tx = nullptr;
     }
     // i2c_bus is borrowed from caller — don't free it here.
     g_i2c_bus = nullptr;

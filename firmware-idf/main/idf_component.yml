@@ -15,3 +15,7 @@ dependencies:
   # ILI9341/ILI9342C panel driver (CoreS3 uses 9342C; the 9341 driver
   # speaks the same SPI command set).
   espressif/esp_lcd_ili9341: "~1.2"
+  # Opus encoder/decoder (we only use decoder for TTS) + container fmts.
+  # Same package xiaozhi-esp32 uses. Decodes ~30-byte opus frames into
+  # 16 kHz mono int16 PCM in well under realtime on ESP32-S3.
+  espressif/esp_audio_codec: "~2.4.1"

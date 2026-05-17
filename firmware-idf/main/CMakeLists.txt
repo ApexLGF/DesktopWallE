@@ -5,6 +5,7 @@ idf_component_register(
                  "wifi_sta.cpp"
                  "bridge_ws.cpp"
                  "lcd.cpp"
+                 "speaker.cpp"
     INCLUDE_DIRS "."
     REQUIRES     nvs_flash
                  spiffs

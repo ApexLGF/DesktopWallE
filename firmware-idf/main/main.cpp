@@ -38,6 +38,7 @@
 #include "wifi_sta.h"
 #include "bridge_ws.h"
 #include "lcd.h"
+#include "speaker.h"
 
 // Re-use the Arduino firmware's config so SSID / bridge host live in
 // one place. (gitignored)
@@ -57,7 +58,7 @@ namespace {
 
 constexpr uint32_t kMicSampleRateHz = 16000;
 constexpr int      kMicGainDb       = 60;
-constexpr int      kVadChannel      = 2;       // ES7210 TDM slot — verified on CoreS3
+constexpr int      kVadChannel      = 0;       // ES7210 2-ch open: slot 0 = primary mic, slot 1 = AEC ref
 constexpr char     kFwVersion[]     = "idf-0.1.0";
 
 void heap_dump(const char *where) {
@@ -139,6 +140,9 @@ extern "C" void app_main(void) {
     if (mic_init(i2c_bus, kMicSampleRateHz, kMicGainDb) != ESP_OK) {
         ESP_LOGE(TAG, "mic_init failed");
         return;
+    }
+    if (speaker_init(i2c_bus, kMicSampleRateHz) != ESP_OK) {
+        ESP_LOGW(TAG, "speaker_init failed — TTS will be silent");
     }
     // ─── LCD ───────────────────────────────────────────────────────────
     // Bring up the screen before WiFi so the user has visual feedback

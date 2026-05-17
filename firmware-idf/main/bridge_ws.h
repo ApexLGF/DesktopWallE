@@ -48,6 +48,12 @@ void bridge_ws_send_mic_pcm(const int16_t *samples, size_t n_samples);
 // mic is open.
 void bridge_ws_signal_speech_end(const char *reason);
 
+// Emit `evt tts.done sid=<sid>` to the bridge. Called by speaker.cpp
+// when the playback queue has drained past its end-of-utterance
+// sentinel. Lets the bridge release its tts_lock and stop suppressing
+// mic input.
+void bridge_ws_send_tts_done(uint16_t sid);
+
 #ifdef __cplusplus
 }
 #endif

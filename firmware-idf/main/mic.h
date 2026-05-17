@@ -15,10 +15,17 @@
 
 #include "esp_err.h"
 #include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Borrowed handle to the TX side of the shared TDM bus. speaker.cpp uses
+// this to hook AW88298 onto the same I2S port — both chips share BCLK
+// and WS, so they must share an i2s channel pair.
+i2s_chan_handle_t mic_get_i2s_tx_handle(void);
+i2s_port_t        mic_get_i2s_port(void);
 
 // One-shot init. Pass the shared I2C bus handle so the codec sits on
 // the same bus as the PMU (we don't want two masters on the same pins).
