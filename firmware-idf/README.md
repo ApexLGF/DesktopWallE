@@ -168,17 +168,49 @@ starved). AW9523 was never touched either.
 M5Stack stock firmware does this in their HAL init *before* the audio
 codec is created. We need to do the same.
 
-## Next phases
+## Phase 3 — ws bridge + mic streaming + VAD-driven mic.end (plumbing GREEN)
 
-- **Phase 3**: hook the device into the bridge via ws (ocsc.v2). On
-  SILENCE→SPEECH transition send `mic.start` + start streaming raw PCM
-  up as `KIND_MIC_PCM` binary frames. On SPEECH→SILENCE (with the
-  built-in 1 s noise-min trailing latency) emit `mic.end`. The bridge's
-  `_capture_utterance` already waits on `mic.end`, so no bridge
-  changes needed beyond the ws connect itself.
-- **Phase 4**: decide whether to fold the rest of the firmware (servos,
-  LCD, LEDs, 34 HTTP endpoints) into the IDF project or keep two
-  firmwares.
+Wired the IDF firmware to the existing bridge over ocsc.v2:
+
+- WiFi STA via `wifi_sta.cpp` (reads SSID / password from `../../include/config.h`
+  so the Arduino + IDF firmwares share one config file)
+- `esp_websocket_client` to `ws://STACKPROXY_WS_HOST:8765/` (`bridge_ws.cpp`)
+- On connect: send hello with MAC-derived device_id + NVS boot counter
+- On `mic_start` RPC: flip into streaming mode; PCM frames go out as
+  `KIND_MIC_PCM` binary frames (8-byte header + raw int16 LE)
+- On VADNet `SPEECH → SILENCE` transition while streaming: send
+  `{"t":"mic.end","sid":N,"reason":"vad","total":N}` text frame
+- Bridge `_capture_utterance` was updated to wake on the `mic.end`
+  event, replacing the slower bridge-side RMS VAD
+
+Verified live on the device:
+
+  - `→ hello hotdog-441bf6e26368 boot=2`
+  - `← hello.ack — bridge online`
+  - `← req mic_start  sid=2`  →  `mic streaming on, sid=2`
+  - device VADNet fired:  `>>> SPEECH → SILENCE`  →  `→ mic.end sid=6 reason=vad sent=20 frames`
+  - bridge accumulated 32 KB/s PCM, no drops, no `ws error`
+  - WS stable through multiple turns after task_stack bumped to 8 KB
+    (default 4 KB overflowed under cJSON + send_bin at 31 fps)
+
+**Known limitation**: device has no user-facing feedback yet — no LCD
+text, no LED indicator. Without seeing serial, the user can't tell when
+the bridge has opened the mic. So end-to-end with a real user is gated
+on the next phase.
+
+## Next phase
+
+- **Phase 4 (now critical)**: wire AT LEAST one visible cue on the
+  device — either:
+    - port the M5StackChan `setOnAir` LED-ring color pulse via WS2812
+      driver, OR
+    - drive the LCD via M5GFX → `esp_lcd` panel and render the
+      "请讲" / "已听到" / "回复" panels from the bridge's `show_text` RPCs.
+  After this, you can actually talk to the device without watching
+  serial.
+- **Phase 5**: port servos + remaining 34 HTTP endpoints from the
+  Arduino firmware, or keep the two-firmware setup with the IDF one
+  owning audio and the Arduino one owning motion/UI.
 
 ## Why VADNet not lightweight VAD
 

@@ -1,13 +1,16 @@
-// DesktopWallE — ESP-IDF spike, Phase 2: live mic → VADNet on M5 CoreS3.
+// DesktopWallE — ESP-IDF spike, Phase 3: device ↔ bridge wired up.
 //
-// Boots, loads vadnet1_medium, opens ES7210 mic over I2S @ 16 kHz mono,
-// then continuously feeds 32 ms frames into VADNet and logs every
-// SPEECH ⇄ SILENCE transition with a timestamp. This is the proof that
-// device-side VAD can replace bridge-side RMS guessing.
+// Boot order:
+//   nvs → srmodel/vadnet → I2C → pmu (AXP2101 + AW9523) → mic (ES7210)
+//   → wifi STA → ocsc.v2 ws to bridge → hello → wait
 //
-// Talk into the mic and watch the serial — you should see SILENCE→SPEECH
-// land within ~30–60 ms of voice onset, and SPEECH→SILENCE after the
-// configured min_noise_ms (1 s by default) of trailing quiet.
+// Steady state (mic loop):
+//   - read 32 ms PCM (ch2 = real mic on CoreS3) → VADNet
+//   - if bridge has called mic_start, every frame is pushed up as a
+//     KIND_MIC_PCM binary frame
+//   - on SPEECH→SILENCE transition (1 s trailing-silence latency baked
+//     into VADNet's min_noise_ms), emit `mic.end` text frame. Bridge's
+//     _capture_utterance picks this up and stops waiting on RMS.
 
 #include <stdio.h>
 #include <string.h>
@@ -16,7 +19,9 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -30,13 +35,29 @@
 
 #include "mic.h"
 #include "pmu.h"
+#include "wifi_sta.h"
+#include "bridge_ws.h"
+
+// Re-use the Arduino firmware's config so SSID / bridge host live in
+// one place. (gitignored)
+#if __has_include("../../include/config.h")
+#  include "../../include/config.h"
+#else
+#  warning "include/config.h not found — using empty defaults. Copy include/config.example.h."
+#  define STACKCHAN_WIFI_SSID     ""
+#  define STACKCHAN_WIFI_PASSWORD ""
+#  define STACKPROXY_WS_HOST      ""
+#  define STACKPROXY_WS_PORT      8765
+#endif
 
 static const char *TAG = "vad_spike";
 
 namespace {
 
 constexpr uint32_t kMicSampleRateHz = 16000;
-constexpr int      MIC_GAIN_DB    = 60;   // matches M5Stack stock firmware
+constexpr int      kMicGainDb       = 60;
+constexpr int      kVadChannel      = 2;       // ES7210 TDM slot — verified on CoreS3
+constexpr char     kFwVersion[]     = "idf-0.1.0";
 
 void heap_dump(const char *where) {
     ESP_LOGI(TAG, "[heap @ %s] free internal=%u  free psram=%u  largest internal=%u",
@@ -46,10 +67,32 @@ void heap_dump(const char *where) {
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
+// Pull a stable device_id from MAC + bump a boot_count counter in NVS
+// so the bridge can de-duplicate stale ghost sessions.
+void load_device_id_and_boot(char *device_id_out, size_t cap, uint32_t *boot_count_out) {
+    uint8_t mac[6] = {0};
+    esp_efuse_mac_get_default(mac);
+    snprintf(device_id_out, cap, "hotdog-%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    nvs_handle_t h = 0;
+    if (nvs_open("dw", NVS_READWRITE, &h) == ESP_OK) {
+        uint32_t bc = 0;
+        nvs_get_u32(h, "boot", &bc);
+        bc += 1;
+        nvs_set_u32(h, "boot", bc);
+        nvs_commit(h);
+        nvs_close(h);
+        *boot_count_out = bc;
+    } else {
+        *boot_count_out = 0;
+    }
+}
+
 }  // namespace
 
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "===== DesktopWallE IDF spike (Phase 2: live mic) =====");
+    ESP_LOGI(TAG, "===== DesktopWallE IDF spike (Phase 3: ws bridge) =====");
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
 
     {
@@ -62,160 +105,110 @@ extern "C" void app_main(void) {
     }
     heap_dump("post-nvs");
 
-    // ─── esp-sr model + VADNet ──────────────────────────────────────────
+    char     device_id[64];
+    uint32_t boot_count = 0;
+    load_device_id_and_boot(device_id, sizeof(device_id), &boot_count);
+    ESP_LOGI(TAG, "device: %s  boot=%lu", device_id, (unsigned long)boot_count);
+
+    // ─── VADNet ─────────────────────────────────────────────────────────
     srmodel_list_t *models = esp_srmodel_init("model");
-    if (!models) {
-        ESP_LOGE(TAG, "esp_srmodel_init(\"model\") returned NULL");
-        return;
-    }
+    if (!models) { ESP_LOGE(TAG, "srmodel_init failed"); return; }
     char *vadn_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
-    if (!vadn_name) {
-        ESP_LOGE(TAG, "no VADNet model in partition");
-        esp_srmodel_deinit(models);
-        return;
-    }
-    ESP_LOGI(TAG, "VADNet model: %s", vadn_name);
-
     auto *vadnet = (esp_vadn_iface_t *)esp_vadn_handle_from_name(vadn_name);
-    if (!vadnet) {
-        ESP_LOGE(TAG, "esp_vadn_handle_from_name failed");
-        esp_srmodel_deinit(models);
-        return;
-    }
-
-    // min_speech_ms=128, min_noise_ms=1000 — the bridge wants ~1 s of
-    // trailing silence to decide "user stopped talking". VAD_MODE_1 is
-    // a balanced sensitivity; if we get false-positives in noisy rooms
-    // bump to MODE_2 or MODE_3.
     model_iface_data_t *model = vadnet->create(vadn_name, VAD_MODE_1, 1, 128, 1000);
-    if (!model) {
-        ESP_LOGE(TAG, "vadnet->create failed");
-        esp_srmodel_deinit(models);
-        return;
-    }
     const int frame_samps = vadnet->get_samp_chunksize(model);
     const int model_sr    = vadnet->get_samp_rate(model);
-    ESP_LOGI(TAG, "VADNet ready: %d Hz × %d samples (%d ms/frame)",
-             model_sr, frame_samps, frame_samps * 1000 / model_sr);
-    heap_dump("post-vadnet-create");
+    ESP_LOGI(TAG, "VADNet: %d Hz × %d samples (%d ms)", model_sr, frame_samps,
+             frame_samps * 1000 / model_sr);
 
-    if ((uint32_t)model_sr != kMicSampleRateHz) {
-        ESP_LOGE(TAG, "VADNet sample rate %d ≠ mic rate %u — this spike "
-                       "doesn't resample, abort.", model_sr, (unsigned)kMicSampleRateHz);
-        vadnet->destroy(model);
-        esp_srmodel_deinit(models);
-        return;
-    }
-
-    // ─── Shared I2C bus on port 1, SDA=12, SCL=11 (CoreS3 wiring) ──────
+    // ─── I2C bus + PMU + Mic ────────────────────────────────────────────
     i2c_master_bus_handle_t i2c_bus = nullptr;
     {
-        i2c_master_bus_config_t bus_cfg = {};
-        bus_cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
-        bus_cfg.i2c_port                     = I2C_NUM_1;
-        bus_cfg.scl_io_num                   = GPIO_NUM_11;
-        bus_cfg.sda_io_num                   = GPIO_NUM_12;
-        bus_cfg.glitch_ignore_cnt            = 7;
-        bus_cfg.flags.enable_internal_pullup = true;
-        ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
+        i2c_master_bus_config_t cfg = {};
+        cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
+        cfg.i2c_port                     = I2C_NUM_1;
+        cfg.scl_io_num                   = GPIO_NUM_11;
+        cfg.sda_io_num                   = GPIO_NUM_12;
+        cfg.glitch_ignore_cnt            = 7;
+        cfg.flags.enable_internal_pullup = true;
+        ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &i2c_bus));
     }
-
-    // ─── PMU bringup (AXP2101 + AW9523) ─ MUST happen before mic init. ──
-    if (pmu_init(i2c_bus) != ESP_OK) {
-        ESP_LOGE(TAG, "pmu_init failed — mic analog rail will be off");
-    }
-    // Give the rails a beat to come up before we touch the codec.
+    pmu_init(i2c_bus);
     vTaskDelay(pdMS_TO_TICKS(100));
-
-    // ─── Mic ────────────────────────────────────────────────────────────
-    if (mic_init(i2c_bus, kMicSampleRateHz, MIC_GAIN_DB) != ESP_OK) {
+    if (mic_init(i2c_bus, kMicSampleRateHz, kMicGainDb) != ESP_OK) {
         ESP_LOGE(TAG, "mic_init failed");
-        vadnet->destroy(model);
-        esp_srmodel_deinit(models);
         return;
     }
-    heap_dump("post-mic-init");
+    heap_dump("post-audio");
 
+    // ─── WiFi STA ───────────────────────────────────────────────────────
+    if (wifi_sta_connect(STACKCHAN_WIFI_SSID, STACKCHAN_WIFI_PASSWORD) != ESP_OK) {
+        ESP_LOGE(TAG, "wifi connect failed — continuing offline (VAD-only)");
+    }
+
+    // ─── ocsc.v2 ws to bridge ───────────────────────────────────────────
+    if (STACKPROXY_WS_HOST[0]) {
+        bridge_ws_start(STACKPROXY_WS_HOST, STACKPROXY_WS_PORT,
+                        device_id, boot_count, kFwVersion);
+    } else {
+        ESP_LOGW(TAG, "STACKPROXY_WS_HOST empty — running offline");
+    }
+    heap_dump("post-ws");
+
+    // ─── Mic streaming + VAD loop ───────────────────────────────────────
     const int nch = mic_channel_count();
     int16_t *multi = (int16_t *)heap_caps_malloc(frame_samps * nch * sizeof(int16_t),
                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     int16_t *mono  = (int16_t *)heap_caps_malloc(frame_samps * sizeof(int16_t),
                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!multi || !mono) {
-        ESP_LOGE(TAG, "OOM mic frame buffer");
-        return;
-    }
+    if (!multi || !mono) { ESP_LOGE(TAG, "OOM mic frame buffer"); return; }
 
-    ESP_LOGI(TAG, "===== streaming mic → VADNet — %d TDM channels — talk to the device =====", nch);
-
-    auto rms_of_ch = [&](const int16_t *p, int n_frames, int nch_, int ch) -> int {
-        long long s = 0;
-        for (int i = 0; i < n_frames; ++i) {
-            int v = p[i * nch_ + ch];
-            s += (long long)v * v;
-        }
-        return (int)(s / (n_frames > 0 ? n_frames : 1));
-    };
-    auto absmax_of_ch = [&](const int16_t *p, int n_frames, int nch_, int ch) -> int {
-        int m = 0;
-        for (int i = 0; i < n_frames; ++i) {
-            int v = p[i * nch_ + ch];
-            int a = v < 0 ? -v : v;
-            if (a > m) m = a;
-        }
-        return m;
-    };
+    ESP_LOGI(TAG, "===== mic loop running — talk to the device =====");
 
     vad_state_t prev    = VAD_SILENCE;
     int64_t     t0_us   = esp_timer_get_time();
     int         frames  = 0;
-    int         speech_frames = 0;
     int         heartbeat_period = 1000 / (frame_samps * 1000 / model_sr);   // ≈31 frames
 
     while (true) {
         int got = mic_read_multi(multi, frame_samps);
         if (got <= 0) {
-            ESP_LOGE(TAG, "mic_read_multi returned %d, retrying", got);
+            ESP_LOGE(TAG, "mic_read_multi returned %d", got);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        // De-interleave channel 2 → mono buffer for VADNet feed.
-        // ch0 looks like the AEC reference loopback (high constant RMS,
-        // doesn't track speech); ch2 has a real-mic-shaped signal.
-        // Pick the channel here, log all 4 in the heartbeat for sanity.
-        constexpr int VAD_CHANNEL = 2;
-        for (int i = 0; i < frame_samps; ++i) mono[i] = multi[i * nch + VAD_CHANNEL];
+        for (int i = 0; i < frame_samps; ++i) mono[i] = multi[i * nch + kVadChannel];
+
+        // Ship PCM up to bridge whenever it's asked for it (mic_streaming
+        // flag flips on at mic_start RPC, off at mic.end / mic_stop).
+        if (bridge_ws_mic_streaming()) {
+            bridge_ws_send_mic_pcm(mono, frame_samps);
+        }
 
         vad_state_t cur = vadnet->detect(model, mono);
         ++frames;
-        if (cur == VAD_SPEECH) ++speech_frames;
 
         if (cur != prev) {
-            int64_t ms_since_boot = (esp_timer_get_time() - t0_us) / 1000;
-            ESP_LOGI(TAG, ">>> t=%6lld ms  frame=%5d  %-7s → %-7s",
-                     ms_since_boot, frames,
+            int64_t ms = (esp_timer_get_time() - t0_us) / 1000;
+            ESP_LOGI(TAG, ">>> t=%6lld ms  %-7s → %-7s  ws=%d streaming=%d",
+                     ms,
                      prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
-                     cur  == VAD_SPEECH ? "SPEECH" : "SILENCE");
+                     cur  == VAD_SPEECH ? "SPEECH" : "SILENCE",
+                     bridge_ws_is_connected(), bridge_ws_mic_streaming());
+            // SPEECH→SILENCE while streaming = end-of-utterance.
+            if (prev == VAD_SPEECH && cur == VAD_SILENCE && bridge_ws_mic_streaming()) {
+                bridge_ws_signal_speech_end("vad");
+            }
             prev = cur;
         }
 
-        // 1 Hz heartbeat — log RMS+peak for every channel so we can see
-        // which TDM slot has the actual mic input.
         if ((frames % heartbeat_period) == 0) {
-            char chinfo[200] = {0};
-            int  off         = 0;
-            for (int c = 0; c < nch; ++c) {
-                int r = rms_of_ch(multi, frame_samps, nch, c);
-                int p = absmax_of_ch(multi, frame_samps, nch, c);
-                off += snprintf(chinfo + off, sizeof(chinfo) - off,
-                                "  ch%d[rms=%d peak=%d]", c, r, p);
-            }
-            ESP_LOGI(TAG, "[hb] t=%6lld ms  frames=%d  state=%s  speech_pct=%.1f%% %s",
+            ESP_LOGI(TAG, "[hb] t=%6lld ms frames=%d  ws=%d streaming=%d  state=%s",
                      (esp_timer_get_time() - t0_us) / 1000,
                      frames,
-                     cur == VAD_SPEECH ? "SPEECH" : "SILENCE",
-                     100.0 * speech_frames / frames,
-                     chinfo);
+                     bridge_ws_is_connected(),
+                     bridge_ws_mic_streaming(),
+                     cur == VAD_SPEECH ? "SPEECH" : "SILENCE");
         }
     }
 }

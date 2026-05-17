@@ -209,6 +209,11 @@ class Device:
     mic_prebuf: list[bytes] | None = None            # buffer mic_pcm frames while ASR is connecting
     mic_filter: dict = field(default_factory=_make_mic_filter)  # 317 Hz notch state
     tts_done_evt: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set by handle_text whenever the device sends a `mic.end` text frame.
+    # _capture_utterance waits on this OR its own RMS VAD to decide when
+    # the user has stopped talking. Device-side VADNet (firmware-idf)
+    # fires this with reason="vad" + ~1 s trailing silence latency.
+    mic_end_evt: asyncio.Event = field(default_factory=asyncio.Event)
     # Rolling dialog history fed back to Doubao ASR as `context_type=dialog_ctx`
     # so consecutive turns benefit from earlier-turn vocabulary / names /
     # references. Ordered newest-first (per Volcengine spec). Capped to
@@ -377,8 +382,17 @@ async def handle_text(hub: Hub, device: Device, raw: str) -> None:
             log.info("[evt] %s tts.done", device.device_id)
         else:
             log.info("[evt] %s %s %s", device.device_id, name, msg.get("d"))
-    elif t in ("mic.start", "mic.end"):
-        log.info("[%s] %s sid=%s (audio wired in P3)", device.device_id, t, msg.get("sid"))
+    elif t == "mic.start":
+        log.info("[%s] mic.start sid=%s sr=%s",
+                 device.device_id, msg.get("sid"), msg.get("sr"))
+    elif t == "mic.end":
+        # Device-side VAD says the user stopped talking. Wake any
+        # _capture_utterance waiting on this device so it doesn't have
+        # to fall back to its slower bridge-side RMS detector.
+        device.mic_end_evt.set()
+        log.info("[%s] mic.end sid=%s reason=%s total=%s",
+                 device.device_id, msg.get("sid"), msg.get("reason"),
+                 msg.get("total"))
     else:
         log.debug("[ws] unhandled text %s from %s", t, device.device_id)
 
@@ -988,6 +1002,7 @@ async def _capture_utterance(hub: Hub, device: Device,
 
     # --- 1. Start mic capture (NO Doubao session opened up-front any more).
     device.mic_dump = bytearray()
+    device.mic_end_evt.clear()    # rearm — device may have left it set from prior turn
     sid            = device.next_sid()
     device.asr_sid = sid
     try:
@@ -1017,6 +1032,15 @@ async def _capture_utterance(hub: Hub, device: Device,
                 log.info("[voice] capture hit max=%.1fs", max_record_s)
                 break
             if device.mic_dump is None:
+                break
+
+            # Device-side VAD said "user stopped talking" — trust it
+            # over our crude RMS detector. The device's VADNet has
+            # ~1 s trailing-silence latency baked in so by the time we
+            # see this event the audio buffer already contains the full
+            # utterance with natural tail.
+            if device.mic_end_evt.is_set() and elapsed >= MIN_RECORD_S:
+                log.info("[voice] device mic.end after +%.2fs → stop", elapsed)
                 break
 
             # RMS of the last ENERGY_WINDOW_MS of audio.
