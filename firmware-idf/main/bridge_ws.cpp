@@ -19,6 +19,12 @@
 #include "speaker.h"
 #include "led.h"
 #include "servo.h"
+#include "pmu.h"
+#include "esp_system.h"
+#include "esp_app_desc.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "bridge_ws";
 
@@ -236,6 +242,30 @@ void handle_req(cJSON *root) {
         }
         if (err == ESP_OK) send_res_ok(rpc_id, nullptr);
         else               send_res_err(rpc_id, "led_failed", esp_err_to_name(err));
+    } else if (strcmp(method, "face") == 0 ||
+               strcmp(method, "display_face") == 0 ||
+               strcmp(method, "set_face") == 0) {
+        // Render a StackChan face expression. params {expr, eye?, mouth?, bg?}
+        // Colours are 0xRRGGBB integers; defaults match the old firmware
+        // (white eye + mouth on black). Expression names: neutral, happy,
+        // smile, love, sad, angry, surprised, thinking, sleep, wink_l,
+        // wink_r, stare, dead, embarrassed, cat, speak/talking.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "expr") : nullptr;
+        if (!cJSON_IsString(e_j))
+            e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "expression") : nullptr;
+        if (!cJSON_IsString(e_j)) {
+            send_res_err(rpc_id, "bad_params", "missing expr");
+            return;
+        }
+        const cJSON *eye_j   = cJSON_GetObjectItemCaseSensitive(p_j, "eye");
+        const cJSON *mouth_j = cJSON_GetObjectItemCaseSensitive(p_j, "mouth");
+        const cJSON *bg_j    = cJSON_GetObjectItemCaseSensitive(p_j, "bg");
+        uint32_t eye   = cJSON_IsNumber(eye_j)   ? (uint32_t)eye_j->valueint   : 0xFFFFFF;
+        uint32_t mouth = cJSON_IsNumber(mouth_j) ? (uint32_t)mouth_j->valueint : 0xFFFFFF;
+        uint32_t bg    = cJSON_IsNumber(bg_j)    ? (uint32_t)bg_j->valueint    : 0x000000;
+        lcd_face_set(e_j->valuestring, eye, mouth, bg);
+        send_res_ok(rpc_id, nullptr);
     } else if (strcmp(method, "set_led_effect") == 0 ||
                strcmp(method, "led_effect") == 0) {
         // Animated LED effect. params {name, r?, g?, b?, speed_ms?}.
@@ -264,6 +294,7 @@ void handle_req(cJSON *root) {
             send_res_err(rpc_id, "effect_failed", esp_err_to_name(err));
     } else if (strcmp(method, "move") == 0 ||
                strcmp(method, "head") == 0 ||
+               strcmp(method, "move_head") == 0 ||
                strcmp(method, "head_normalized") == 0) {
         // Move the head servos. Accepts either:
         //   m=move          → params {x: sc-units, y: sc-units, speed}
@@ -291,7 +322,8 @@ void handle_req(cJSON *root) {
         }
         servo_move(x, y, speed);
         send_res_ok(rpc_id, nullptr);
-    } else if (strcmp(method, "action") == 0) {
+    } else if (strcmp(method, "action") == 0 ||
+               strcmp(method, "do_action") == 0) {
         // Gesture: params {name: "nod" / "shake" / "dance" / ...}.
         // Blocks the ws handler for 0.5–3 s; bridge will see slow ack
         // but no concurrent RPCs are expected during a gesture.
@@ -317,6 +349,77 @@ void handle_req(cJSON *root) {
         servo_torque(1, en);
         servo_torque(2, en);
         send_res_ok(rpc_id, nullptr);
+    } else if (strcmp(method, "volume") == 0) {
+        // Speaker volume. Read: params absent → return current.
+        // Write: params {pct: 0..100}. Returns {pct} in both cases.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *pct_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "pct") : nullptr;
+        if (cJSON_IsNumber(pct_j)) {
+            esp_err_t err = speaker_set_volume(pct_j->valueint);
+            if (err != ESP_OK) {
+                send_res_err(rpc_id, "bad_params", "pct out of range");
+                return;
+            }
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "pct", speaker_get_volume());
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "brightness") == 0) {
+        // LCD backlight via AXP2101 DLDO1. params {pct: 0..100}.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *pct_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "pct") : nullptr;
+        if (cJSON_IsNumber(pct_j)) {
+            esp_err_t err = pmu_set_backlight(pct_j->valueint);
+            if (err != ESP_OK) {
+                send_res_err(rpc_id, "bad_params", "pct out of range");
+                return;
+            }
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "pct", pmu_get_backlight());
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "battery") == 0) {
+        int vbat = 0, vbus = 0, soc = -1;
+        bool chg = false;
+        esp_err_t err = pmu_battery_read(&vbat, &soc, &chg, &vbus);
+        if (err != ESP_OK) {
+            send_res_err(rpc_id, "i2c_failed", esp_err_to_name(err));
+            return;
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "voltage_mv", vbat);
+        cJSON_AddNumberToObject(d, "vbus_mv", vbus);
+        cJSON_AddNumberToObject(d, "percent", soc);
+        cJSON_AddBoolToObject(d, "charging", chg);
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "status") == 0 ||
+               strcmp(method, "get_sensors") == 0) {
+        // System status — returned in {free_heap, free_psram, uptime_ms,
+        // fw, model, vbat, charging, vol, brightness}. Lets the bridge /
+        // agent inspect device health without bouncing through HTTP.
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "uptime_ms", (double)esp_timer_get_time() / 1000.0);
+        cJSON_AddNumberToObject(d, "free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        cJSON_AddNumberToObject(d, "free_psram", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        const esp_app_desc_t *app = esp_app_get_description();
+        if (app) {
+            cJSON_AddStringToObject(d, "fw", app->version);
+            cJSON_AddStringToObject(d, "app", app->project_name);
+        }
+        cJSON_AddNumberToObject(d, "vol", speaker_get_volume());
+        cJSON_AddNumberToObject(d, "brightness", pmu_get_backlight());
+        int vbat = 0; bool chg = false;
+        if (pmu_battery_read(&vbat, nullptr, &chg, nullptr) == ESP_OK) {
+            cJSON_AddNumberToObject(d, "vbat_mv", vbat);
+            cJSON_AddBoolToObject(d, "charging", chg);
+        }
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "reboot") == 0) {
+        // Ack before rebooting — bridge won't see a clean WS close but
+        // the res frame goes out first.
+        send_res_ok(rpc_id, nullptr);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
     } else {
         // display.image / wake_resume / etc. — ack-with-err so bridge
         // doesn't hang waiting for a response.

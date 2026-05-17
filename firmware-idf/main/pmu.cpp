@@ -19,6 +19,9 @@ constexpr uint8_t  AW9523_ADDR  = 0x58;
 constexpr uint32_t I2C_HZ       = 400000;
 constexpr int      I2C_TIMEOUT_MS = 100;
 
+i2c_master_bus_handle_t g_i2c_bus = nullptr;
+int                     g_backlight_pct = 80;
+
 esp_err_t reg_write(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
     return i2c_master_transmit(dev, buf, sizeof(buf), I2C_TIMEOUT_MS);
@@ -116,6 +119,7 @@ esp_err_t init_aw9523(i2c_master_bus_handle_t bus) {
 
 esp_err_t pmu_init(i2c_master_bus_handle_t i2c_bus) {
     esp_err_t err;
+    g_i2c_bus = i2c_bus;
     err = init_axp2101(i2c_bus);
     if (err != ESP_OK) return err;
     err = init_aw9523(i2c_bus);
@@ -123,3 +127,86 @@ esp_err_t pmu_init(i2c_master_bus_handle_t i2c_bus) {
     ESP_LOGI(TAG, "PMU bringup done (ALDO3=3.3V, AW9523 outputs configured)");
     return ESP_OK;
 }
+
+static esp_err_t axp_open(i2c_master_dev_handle_t *out) {
+    if (!g_i2c_bus) return ESP_FAIL;
+    i2c_device_config_t cfg = {};
+    cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    cfg.device_address  = AXP2101_ADDR;
+    cfg.scl_speed_hz    = I2C_HZ;
+    return i2c_master_bus_add_device(g_i2c_bus, &cfg, out);
+}
+
+static esp_err_t axp_read(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *value) {
+    return i2c_master_transmit_receive(dev, &reg, 1, value, 1, I2C_TIMEOUT_MS);
+}
+
+static esp_err_t axp_write(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value) {
+    uint8_t buf[2] = {reg, value};
+    return i2c_master_transmit(dev, buf, sizeof(buf), I2C_TIMEOUT_MS);
+}
+
+esp_err_t pmu_battery_read(int *voltage_mv, int *percent, bool *charging,
+                           int *vbus_mv) {
+    i2c_master_dev_handle_t dev = nullptr;
+    if (axp_open(&dev) != ESP_OK || !dev) return ESP_FAIL;
+
+    uint8_t hi = 0, lo = 0;
+    esp_err_t r;
+    int vbat = 0, vbus = 0, pct = -1;
+    bool chg = false;
+
+    r = axp_read(dev, 0x34, &hi);
+    if (r != ESP_OK) {
+        i2c_master_bus_rm_device(dev);
+        return r;
+    }
+    axp_read(dev, 0x35, &lo);
+    vbat = ((int)(hi & 0x3F) << 8) | lo;
+
+    axp_read(dev, 0x56, &hi);
+    axp_read(dev, 0x57, &lo);
+    vbus = ((int)(hi & 0x3F) << 8) | lo;
+
+    uint8_t soc = 0;
+    if (axp_read(dev, 0xA4, &soc) == ESP_OK) pct = soc;
+
+    uint8_t st0 = 0, st1 = 0;
+    axp_read(dev, 0x00, &st0);
+    axp_read(dev, 0x01, &st1);
+    chg = (st0 & 0x04) && (((st1 >> 5) & 0x03) != 0);
+
+    if (voltage_mv) *voltage_mv = vbat;
+    if (vbus_mv)    *vbus_mv    = vbus;
+    if (percent)    *percent    = pct;
+    if (charging)   *charging   = chg;
+
+    i2c_master_bus_rm_device(dev);
+    return ESP_OK;
+}
+
+esp_err_t pmu_set_backlight(int pct) {
+    if (pct < 0 || pct > 100) return ESP_ERR_INVALID_ARG;
+    if (!g_i2c_bus) return ESP_FAIL;
+    i2c_master_dev_handle_t dev = nullptr;
+    if (axp_open(&dev) != ESP_OK || !dev) return ESP_FAIL;
+
+    uint8_t code = 0;
+    if (pct > 0) {
+        code = (uint8_t)(4 + (pct * 24 + 50) / 100);
+        if (code > 28) code = 28;
+    }
+    axp_write(dev, 0x99, code);
+
+    uint8_t cur = 0;
+    axp_read(dev, 0x90, &cur);
+    if (pct > 0) cur |= 0x80; else cur &= ~0x80;
+    axp_write(dev, 0x90, cur);
+
+    g_backlight_pct = pct;
+    i2c_master_bus_rm_device(dev);
+    ESP_LOGI(TAG, "backlight = %d%% (DLDO1 code=%d)", pct, code);
+    return ESP_OK;
+}
+
+int pmu_get_backlight(void) { return g_backlight_pct; }

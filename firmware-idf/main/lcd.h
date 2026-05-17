@@ -25,6 +25,7 @@ typedef enum {
     LCD_STATE_ERROR     = 8,  // red + "ERR"
     LCD_STATE_ASR       = 9,  // cyan + "ASR" — mic closed, server-side ASR running
     LCD_STATE_ASR_ERR   = 10, // dim red + "ASR ERR" — ASR returned nothing
+    LCD_STATE_FACE      = 11, // StackChan face — eye + mouth + brow render
 } lcd_state_t;
 
 esp_err_t lcd_init(void);
@@ -43,6 +44,15 @@ void      lcd_set_think_elapsed(int seconds);
 // Used to return the screen to a polite "ready for next turn" indicator
 // after TTS playback drains.
 void      lcd_arm_idle_in(uint32_t delay_ms);
+
+// Set the StackChan face renderer. Switches LCD state to LCD_STATE_FACE
+// and repaints with the given expression + colours. Expression names
+// match the old Arduino firmware:
+//   neutral, happy, smile, love, sad, angry, surprised, thinking,
+//   sleep, wink_l, wink_r, stare, dead, embarrassed, cat, speak / talking
+// `eye_rgb`, `mouth_rgb`, `bg_rgb` are 24-bit packed RGB (0xRRGGBB).
+void      lcd_face_set(const char *expression,
+                       uint32_t eye_rgb, uint32_t mouth_rgb, uint32_t bg_rgb);
 
 #ifdef __cplusplus
 }

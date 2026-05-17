@@ -22,5 +22,6 @@ idf_component_register(
                  esp_driver_spi
                  esp_driver_uart
                  esp_lcd
+                 esp_app_format
                  esp-sr
 )

@@ -53,6 +53,15 @@ void      speaker_stop(void);
 // True if PCM is currently queued or playing.
 bool      speaker_is_active(void);
 
+// Set output volume as integer percent in [0, 100]. 0 mutes; 100 is the
+// codec's full scale (0 dB). Persisted in RAM only — restored after the
+// next codec_dev_open. Returns ESP_OK on success or ESP_ERR_INVALID_ARG
+// if `pct` is out of range.
+esp_err_t speaker_set_volume(int pct);
+
+// Current volume percent (1..100), or -1 if speaker_init hasn't run.
+int       speaker_get_volume(void);
+
 #ifdef __cplusplus
 }
 #endif

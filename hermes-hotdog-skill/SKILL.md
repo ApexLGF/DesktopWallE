@@ -25,14 +25,21 @@ The Bridge `/rpc` endpoint is a *generic dispatcher*. The device firmware implem
 
 | Method | Params | What it does |
 |---|---|---|
-| `ping` | none | Liveness check |
-| `move_head` | `{x, y, speed}` | Move head to absolute position. `x` -1280..1280 (yaw, -=left), `y` 30..870 (pitch, small=up, ~400=neutral), `speed` 0..1000. |
-| `do_action` | `{name}` | Predefined gesture. `name` must be one of: `home`, `nod`, `shake`, `left`, `right`, `look_up`, `look_down`. |
-| `set_led` | `{r, g, b}` or `{r, g, b, index}` | RGB ring. Without `index`: all 12 LEDs. With `index` 0..11: just that one. Each channel 0..255. |
-| `set_face` | `{expr}` | Built-in face on the LCD. `expr` ∈ `neutral`, `happy`, `sad`, `surprised`, `sleepy`, `thinking`, `alert`. v1 paints flat colors as placeholders. |
-| `show_text` | `{title, text}` | Show text on the LCD (v1 placeholder: paints a band; use `show_image` with rendered PNG for real glyphs). |
-| `cam_capture` | `{sid?, quality?}` | Internal — don't call directly. The Bridge wraps this in `/capture`. |
-| `get_sensors` | none | Returns `{battery_pct, heap_free, boot_count, wifi}`. |
+| `ping` | none | Liveness check. |
+| `move` (alias: `move_head`, `head`) | `{x, y, speed}` | Move head to absolute servo position. `x` -1280..1280 (yaw, −=left), `y` 30..850 (pitch, small=up, ~425=neutral), `speed` 0..1000. |
+| `head_normalized` | `{nx, ny, speed}` | Same motion in normalized [-1, 1] coordinates (used by face tracker). |
+| `action` (alias: `do_action`) | `{name}` | Predefined gesture. `name` ∈ `home`, `nod`, `shake`, `yes`, `no`, `look_up`, `look_down`, `look_left`, `look_right`, `look_around`, `dance`, `surprised`, `sleep`, `wake`, `panic`, `peek`, `bow`, `tilt_left`, `tilt_right`. Blocks the call until the gesture finishes (≤3 s). |
+| `torque` | `{enabled: bool}` | Enable / disable holding torque on both head servos. Disabled = head goes limp (good for being moved by hand). |
+| `set_led` | `{r, g, b}` or `{r, g, b, index}` | Solid color on the 12-LED ring. Without `index`: all LEDs. With `index` 0..11: just that one. Each channel 0..255. |
+| `set_led_effect` (alias: `led_effect`) | `{name, r?, g?, b?, speed_ms?}` | Animated effect. `name` ∈ `off`, `solid`, `rainbow`, `breathing`, `pulse`, `scanner`, `wipe`, `sparkle`, `police`, `fire`, `chase`, `theater`, `listening`, `thinking`, `talking`, `recording`. `r/g/b` is the base color where applicable; `speed_ms` overrides the effect's default tick. |
+| `face` (alias: `set_face`, `display_face`) | `{expression, eye_rgb?, mouth_rgb?, bg_rgb?}` | StackChan-style face on the LCD. `expression` ∈ `neutral`, `happy`, `smile`, `love`, `sad`, `angry`, `surprised`, `thinking`, `sleep`, `wink_l`, `wink_r`, `stare`, `dead`, `embarrassed`, `cat`, `speak`/`talking`. Colors are 24-bit packed (e.g. `0x00ff00`). |
+| `show_text` | `{title, text}` | Title-driven LCD state hint (HEARD / THINK / TALK / ASR / IDLE …). For real text rendering, use Bridge `/show_text` (PIL on the Mac mini, ships JPEG). |
+| `volume` | `{pct?}` (0..100) | Speaker volume. Without params → returns current. With `pct` → sets. Returns `{pct}`. |
+| `brightness` | `{pct?}` (0..100) | LCD backlight via AXP2101 DLDO1. Same read/write pattern as `volume`. |
+| `battery` | none | Returns `{voltage_mv, vbus_mv, percent, charging}` from the AXP2101 fuel gauge. |
+| `status` (alias: `get_sensors`) | none | Returns `{uptime_ms, free_heap, free_psram, fw, app, vol, brightness, vbat_mv, charging}`. |
+| `reboot` | none | Sends the ack frame then `esp_restart()` — bridge reconnects on the new boot. |
+| `cam_capture` | internal | Don't call directly — Bridge wraps this in `/capture`. Currently disabled (esp_camera lockup on this firmware revision). |
 
 **There is no `motion.nod`. There is no `led.set`. There is no `face.show`.** If you
 call something not in the table above, the device returns `not_implemented` and `/rpc`
@@ -56,16 +63,15 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8766/say \
 Returns `{"ok":true,"bytes":...,"est_ms":...}`. Audio plays for `est_ms` ms after the
 call returns. For longer text expect ~30 chars/second of playback.
 
-### 2) Predefined gesture — `POST /rpc` with `do_action`
+### 2) Predefined gesture — `POST /rpc` with `action`
 
 ```sh
 curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
   -H 'Content-Type: application/json' \
-  -d '{"method":"do_action","params":{"name":"nod"},"timeout":8}'
+  -d '{"method":"action","params":{"name":"nod"},"timeout":8}'
 ```
 
-`name` must be one of `home | nod | shake | left | right | look_up | look_down`.
-A nod or shake takes ~1.2 s; the call blocks until done.
+`name` ∈ `home | nod | shake | yes | no | look_up | look_down | look_left | look_right | look_around | dance | surprised | sleep | wake | panic | peek | bow | tilt_left | tilt_right`. Quick gestures (nod / shake / yes / no) take ~1–2 s; `dance` and `look_around` take 3–5 s. The call blocks until done.
 
 ### 3) Set the LED ring — `POST /rpc` with `set_led`
 
@@ -79,7 +85,17 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
 curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
   -H 'Content-Type: application/json' \
   -d '{"method":"set_led","params":{"r":0,"g":255,"b":0,"index":3}}'
+
+# animated effect — rainbow / breathing / fire / police / scanner / etc.
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"set_led_effect","params":{"name":"breathing","r":40,"g":120,"b":200}}'
 ```
+
+Effect names: `off`, `solid`, `rainbow`, `breathing`, `pulse`, `scanner`,
+`wipe`, `sparkle`, `police`, `fire`, `chase`, `theater`, `listening`,
+`thinking`, `talking`, `recording`. The animation runs on the device until
+you change effect or call `set_led_effect {name:"off"}`.
 
 ### 4) Take a photo — `POST /capture`
 
@@ -200,15 +216,65 @@ curl -X POST http://127.0.0.1:8766/perform -d '{
 After the last cue + ~1.5 s, bridge **automatically** restores the `idle`
 face — don't add a "reset face" cleanup step.
 
-### 10) Read sensors — `POST /rpc` with `get_sensors`
+### 10) Read sensors / status — `POST /rpc` with `status` or `battery`
+
+```sh
+# everything in one shot (uptime, free heap/psram, fw, vol, brightness, vbat)
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"status"}'
+
+# just the battery
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -d '{"method":"battery"}'
+```
+
+`status` returns `{uptime_ms, free_heap, free_psram, fw, app, vol, brightness, vbat_mv, charging}`.
+`battery` returns `{voltage_mv, vbus_mv, percent, charging}`.
+
+### 11) Volume / brightness / reboot — `POST /rpc`
+
+```sh
+# set speaker volume to 60%
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -d '{"method":"volume","params":{"pct":60}}'
+
+# read current volume (no params)
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -d '{"method":"volume"}'
+
+# dim the LCD backlight
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -d '{"method":"brightness","params":{"pct":30}}'
+
+# soft reboot the device
+curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
+  -d '{"method":"reboot"}'
+```
+
+The device ACKs `reboot` then `esp_restart()`s; the bridge sees the connection
+drop and the next `/status` lists `last_seen_age_s > 5` for ~3 s until the
+device reconnects with `boot_count + 1`.
+
+### 12) On-device face — `POST /rpc` with `face`
+
+A second face renderer lives **on the device** (drawn straight to the LCD
+framebuffer, no JPEG round-trip). It's faster and supports more expressions
+than the bridge `/face` endpoint:
 
 ```sh
 curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc \
-  -H 'Content-Type: application/json' \
-  -d '{"method":"get_sensors"}'
+  -d '{"method":"face","params":{"expression":"happy","eye_rgb":"0x00ff00","mouth_rgb":"0x00ff00","bg_rgb":"0x000000"}}'
 ```
 
-Returns `{"ok":true,"result":{"battery_pct":100,"heap_free":...,"boot_count":...,"wifi":true}}`.
+`expression` ∈ `neutral`, `happy`, `smile`, `love`, `sad`, `angry`,
+`surprised`, `thinking`, `sleep`, `wink_l`, `wink_r`, `stare`, `dead`,
+`embarrassed`, `cat`, `speak` / `talking`. Colors are 24-bit hex (string
+`"0xRRGGBB"`) or 32-bit ints.
+
+Use bridge `/face` (section 7) for the cyan-on-navy default robot look used
+during recitation. Use this device `face` RPC when you want a vivid mood
+expression that pops on the panel.
 
 ## End-to-end example: "say X then nod twice then red light"
 
@@ -219,7 +285,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8766/say -H 'Content-Type: applic
 # nod twice — issue back-to-back; the second waits for the first to finish
 for i in 1 2; do
   curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc -H 'Content-Type: application/json' \
-    -d '{"method":"do_action","params":{"name":"nod"},"timeout":8}'
+    -d '{"method":"action","params":{"name":"nod"},"timeout":8}'
 done
 
 curl -s --noproxy '*' -X POST http://127.0.0.1:8766/rpc -H 'Content-Type: application/json' \

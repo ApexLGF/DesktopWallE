@@ -42,6 +42,7 @@ constexpr i2c_port_num_t   I2C_PORT     = I2C_NUM_1;
 constexpr uint8_t          AW88298_ADDR = (0x36 << 1);
 // esp_codec_dev_set_out_vol takes an INT in [1..100] (1=-49.5dB, 100=0dB).
 constexpr int              DEFAULT_VOL_PCT = 80;
+int                        g_volume_pct  = DEFAULT_VOL_PCT;
 constexpr int              QUEUE_DEPTH    = 80;     // ~5 sec of 60-ms chunks
 constexpr int              PREBUFFER_CHUNKS = 5;    // ~300 ms before first write
 constexpr int              OPUS_QUEUE_DEPTH = 80;   // matches xiaozhi's 2.4 s decode buffer
@@ -98,7 +99,7 @@ void open_for_playback() {
         ESP_LOGE(TAG, "codec_dev_open: %s", esp_err_to_name(err));
         return;
     }
-    esp_codec_dev_set_out_vol(g_codec_dev, DEFAULT_VOL_PCT);
+    esp_codec_dev_set_out_vol(g_codec_dev, g_volume_pct);
     esp_codec_dev_set_out_mute(g_codec_dev, false);
     g_is_open = true;
 }
@@ -381,3 +382,17 @@ void speaker_stop(void) {
 }
 
 bool speaker_is_active(void) { return g_active; }
+
+esp_err_t speaker_set_volume(int pct) {
+    if (pct < 0 || pct > 100) return ESP_ERR_INVALID_ARG;
+    g_volume_pct = pct;
+    if (g_codec_dev && g_is_open) {
+        esp_codec_dev_set_out_vol(g_codec_dev, pct);
+    }
+    ESP_LOGI(TAG, "volume = %d%%", pct);
+    return ESP_OK;
+}
+
+int speaker_get_volume(void) {
+    return g_codec_dev ? g_volume_pct : -1;
+}
