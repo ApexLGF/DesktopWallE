@@ -25,6 +25,11 @@ esp_err_t led_set_pixel(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 // Set all 12 LEDs to the same color in one transaction.
 esp_err_t led_set_all(uint8_t r, uint8_t g, uint8_t b);
 
+// Enable / disable the servo power rail. The PY32 also gates the head
+// servo bus via its GPIO0; without this set HIGH the SCS servos are
+// dark on the wire and uart writes have no effect.
+esp_err_t led_set_servo_power(bool enable);
+
 #ifdef __cplusplus
 }
 #endif

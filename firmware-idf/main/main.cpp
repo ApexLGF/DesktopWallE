@@ -43,6 +43,7 @@
 #include "speaker.h"
 #include "led.h"
 #include "touch.h"
+#include "servo.h"
 
 // Re-use the Arduino firmware's config so SSID / bridge host live in
 // one place. (gitignored)
@@ -191,6 +192,18 @@ extern "C" void app_main(void) {
     touch_register_tap_cb(on_touch_tap);
     if (touch_init(i2c_bus) != ESP_OK) {
         ESP_LOGW(TAG, "touch init failed — head-tap interrupt disabled");
+    }
+    // Servo power rail is gated on PY32 GPIO0; without this HIGH the
+    // SCS servos are dark on the bus and uart_write has no effect.
+    if (led_set_servo_power(true) != ESP_OK) {
+        ESP_LOGW(TAG, "could not enable servo power rail");
+    }
+    if (servo_init() == ESP_OK) {
+        // Give the bus a beat to settle after power-up before sending.
+        vTaskDelay(pdMS_TO_TICKS(200));
+        servo_home();
+    } else {
+        ESP_LOGW(TAG, "servo init failed — head actions disabled");
     }
     vTaskDelay(pdMS_TO_TICKS(100));
     if (mic_init(i2c_bus, kMicSampleRateHz, kMicGainDb) != ESP_OK) {

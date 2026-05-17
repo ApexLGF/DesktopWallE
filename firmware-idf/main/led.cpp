@@ -19,6 +19,8 @@ constexpr uint8_t  LED_COUNT         = 12;
 
 // Register map (subset)
 constexpr uint8_t  REG_VERSION       = 0x02;
+constexpr uint8_t  REG_GPIO_M_L      = 0x03;     // GPIO direction (bit per pin, 1=output)
+constexpr uint8_t  REG_GPIO_O_L      = 0x05;     // GPIO output state (bit per pin)
 constexpr uint8_t  REG_LED_CFG       = 0x24;
 constexpr uint8_t  REG_LED_RAM_START = 0x30;
 constexpr uint8_t  LED_REFRESH_BIT   = (1 << 6);
@@ -94,6 +96,27 @@ esp_err_t led_set_pixel(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
     esp_err_t err = write_regs((uint8_t)(REG_LED_RAM_START + index * 2), data, 2);
     if (err != ESP_OK) return err;
     return refresh();
+}
+
+esp_err_t led_set_servo_power(bool enable) {
+    if (!g_dev) return ESP_ERR_INVALID_STATE;
+    // Pin 0: set as output AND drive the level. We RMW the low byte of
+    // both the mode and output registers so we don't disturb the other
+    // 7 pins (LED chip uses some of them as inputs).
+    uint8_t mode_l = 0, out_l = 0;
+    if (read_reg(REG_GPIO_M_L, &mode_l) != ESP_OK) return ESP_FAIL;
+    if (read_reg(REG_GPIO_O_L, &out_l)  != ESP_OK) return ESP_FAIL;
+    mode_l |= 0x01;                          // pin 0 → output
+    if (enable) out_l |=  0x01;
+    else        out_l &= ~0x01;
+    esp_err_t err = write_reg(REG_GPIO_M_L, mode_l);
+    if (err != ESP_OK) return err;
+    err = write_reg(REG_GPIO_O_L, out_l);
+    if (err != ESP_OK) return err;
+    ESP_LOGI(TAG, "servo power %s (PY32 GPIO0 %s)",
+             enable ? "on" : "off",
+             enable ? "HIGH" : "LOW");
+    return ESP_OK;
 }
 
 esp_err_t led_set_all(uint8_t r, uint8_t g, uint8_t b) {

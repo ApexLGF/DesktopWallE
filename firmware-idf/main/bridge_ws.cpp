@@ -18,6 +18,7 @@
 #include "lcd.h"
 #include "speaker.h"
 #include "led.h"
+#include "servo.h"
 
 static const char *TAG = "bridge_ws";
 
@@ -235,9 +236,64 @@ void handle_req(cJSON *root) {
         }
         if (err == ESP_OK) send_res_ok(rpc_id, nullptr);
         else               send_res_err(rpc_id, "led_failed", esp_err_to_name(err));
+    } else if (strcmp(method, "move") == 0 ||
+               strcmp(method, "head") == 0 ||
+               strcmp(method, "head_normalized") == 0) {
+        // Move the head servos. Accepts either:
+        //   m=move          → params {x: sc-units, y: sc-units, speed}
+        //   m=head          → same (alias)
+        //   m=head_normalized → params {nx: [-1,1], ny: [-1,1], speed} (face-tracker convention)
+        const cJSON *p_j   = cJSON_GetObjectItemCaseSensitive(root, "p");
+        if (!p_j) { send_res_err(rpc_id, "bad_params", "missing p"); return; }
+        int x = 0, y = 425, speed = 200;
+        if (strcmp(method, "head_normalized") == 0) {
+            const cJSON *nx = cJSON_GetObjectItemCaseSensitive(p_j, "nx");
+            const cJSON *ny = cJSON_GetObjectItemCaseSensitive(p_j, "ny");
+            const cJSON *sp = cJSON_GetObjectItemCaseSensitive(p_j, "speed");
+            double nxv = cJSON_IsNumber(nx) ? nx->valuedouble : 0.0;
+            double nyv = cJSON_IsNumber(ny) ? ny->valuedouble : 0.0;
+            x = (int)(nxv * 1280);
+            y = (int)(((nyv + 1.0) * 0.5) * 850);
+            if (cJSON_IsNumber(sp)) speed = sp->valueint;
+        } else {
+            const cJSON *x_j = cJSON_GetObjectItemCaseSensitive(p_j, "x");
+            const cJSON *y_j = cJSON_GetObjectItemCaseSensitive(p_j, "y");
+            const cJSON *s_j = cJSON_GetObjectItemCaseSensitive(p_j, "speed");
+            if (cJSON_IsNumber(x_j)) x     = x_j->valueint;
+            if (cJSON_IsNumber(y_j)) y     = y_j->valueint;
+            if (cJSON_IsNumber(s_j)) speed = s_j->valueint;
+        }
+        servo_move(x, y, speed);
+        send_res_ok(rpc_id, nullptr);
+    } else if (strcmp(method, "action") == 0) {
+        // Gesture: params {name: "nod" / "shake" / "dance" / ...}.
+        // Blocks the ws handler for 0.5–3 s; bridge will see slow ack
+        // but no concurrent RPCs are expected during a gesture.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *n_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "name") : nullptr;
+        if (!cJSON_IsString(n_j)) {
+            send_res_err(rpc_id, "bad_params", "missing name");
+            return;
+        }
+        esp_err_t err = servo_action(n_j->valuestring);
+        if (err == ESP_OK) {
+            send_res_ok(rpc_id, nullptr);
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            send_res_err(rpc_id, "unknown_action", n_j->valuestring);
+        } else {
+            send_res_err(rpc_id, "action_failed", esp_err_to_name(err));
+        }
+    } else if (strcmp(method, "torque") == 0) {
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "enabled") : nullptr;
+        bool en = cJSON_IsBool(e_j) ? cJSON_IsTrue(e_j) :
+                  cJSON_IsNumber(e_j) ? (e_j->valueint != 0) : true;
+        servo_torque(1, en);
+        servo_torque(2, en);
+        send_res_ok(rpc_id, nullptr);
     } else {
-        // set_led / motion / display.image / wake_resume etc. — ack-with-err
-        // so the bridge doesn't hang waiting for a response.
+        // display.image / wake_resume / etc. — ack-with-err so bridge
+        // doesn't hang waiting for a response.
         send_res_err(rpc_id, "not_implemented", method);
     }
 }
