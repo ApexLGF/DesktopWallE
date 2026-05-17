@@ -83,7 +83,46 @@ Two gotchas worth recording for the next person:
    zip file". We work around this by `EXTRA_COMPONENT_DIRS` to a local
    esp-sr checkout (see root `CMakeLists.txt`).
 
-## Phase 2 — live mic → VADNet (2026-05-17, partial)
+## Phase 2 + 2.5 — live mic → VADNet (2026-05-17, **GREEN**)
+
+End-to-end working on real hardware. 25-second talking test produced
+5 clean `SILENCE → SPEECH → SILENCE` transitions matching sentence
+boundaries, with the ~1 s trailing-silence latency that the bridge
+already waits for.
+
+```
+t= 3.7s  SILENCE → SPEECH
+t= 4.6s  SPEECH  → SILENCE        — sentence 1, 0.9 s
+t= 7.7s  SILENCE → SPEECH
+t= 8.9s  SPEECH  → SILENCE        — sentence 2, 1.2 s
+t=18.0s  SILENCE → SPEECH
+t=19.6s  SPEECH  → SILENCE        — sentence 3, 1.6 s
+t=20.7s  SILENCE → SPEECH
+t=22.1s  SPEECH  → SILENCE        — sentence 4, 1.4 s
+t=22.6s  SILENCE → SPEECH
+t=23.9s  SPEECH  → SILENCE        — sentence 5, 1.3 s
+speech_pct 26.7 %  (198 / 744 frames flagged as speech)
+```
+
+Two gotchas captured along the way:
+
+1. **AXP2101 ALDO3 must be on** (3.3 V analog supply for the ES7210
+   mic PGA). Without it the ES7210 responds happily over I²C (its
+   digital side is powered from USB-VBUS pass-through) but the mic
+   preamp is starved. `pmu.cpp` handles this with M5Stack's stock
+   register sequence.
+2. **The real mic data is in TDM slot 2, not slot 0** when esp_codec_dev
+   reads ES7210 in 4-channel TDM mode with all three mics enabled. Slot
+   0 looks like an AEC reference loopback (constant level, no response
+   to speech), slot 1 is near-silent, slot 3 is dead. Feed slot 2 to
+   VADNet. (For production we'll likely use the AFE pipeline which
+   handles channel assignment internally.)
+
+Prior partial results that drove the investigation are in commit
+history. Old text follows in case you're reading this on an older
+checkout:
+
+### (historical) initial Phase 2 attempt before PMU bringup
 
 Wired the ES7210 mic ADC over I2S into the existing VADNet loop. Whole
 pipeline boots, no crashes. ES7210 reports `Unmuted` and the codec
@@ -131,14 +170,12 @@ codec is created. We need to do the same.
 
 ## Next phases
 
-- **Phase 2.5 (one session)**: write minimal `pmu_init()` — direct I²C
-  writes to AXP2101 + AW9523 to enable ALDO3 + P1.6. Should be ~100
-  lines of C. After this, mic levels should be normal and VADNet
-  transitions should track real speech reliably.
-- **Phase 3**: hook the device into the bridge via ws (ocsc.v2). Send
-  `mic.start`, stream PCM up as KIND_MIC_PCM binary frames, fire
-  `mic.end` evt when VADNet detects 1 s of trailing silence. The bridge
-  side already waits for `mic.end`, no changes needed.
+- **Phase 3**: hook the device into the bridge via ws (ocsc.v2). On
+  SILENCE→SPEECH transition send `mic.start` + start streaming raw PCM
+  up as `KIND_MIC_PCM` binary frames. On SPEECH→SILENCE (with the
+  built-in 1 s noise-min trailing latency) emit `mic.end`. The bridge's
+  `_capture_utterance` already waits on `mic.end`, so no bridge
+  changes needed beyond the ws connect itself.
 - **Phase 4**: decide whether to fold the rest of the firmware (servos,
   LCD, LEDs, 34 HTTP endpoints) into the IDF project or keep two
   firmwares.

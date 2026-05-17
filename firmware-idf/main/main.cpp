@@ -179,8 +179,12 @@ extern "C" void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        // De-interleave ch0 → mono buffer for VADNet feed
-        for (int i = 0; i < frame_samps; ++i) mono[i] = multi[i * nch];
+        // De-interleave channel 2 → mono buffer for VADNet feed.
+        // ch0 looks like the AEC reference loopback (high constant RMS,
+        // doesn't track speech); ch2 has a real-mic-shaped signal.
+        // Pick the channel here, log all 4 in the heartbeat for sanity.
+        constexpr int VAD_CHANNEL = 2;
+        for (int i = 0; i < frame_samps; ++i) mono[i] = multi[i * nch + VAD_CHANNEL];
 
         vad_state_t cur = vadnet->detect(model, mono);
         ++frames;
