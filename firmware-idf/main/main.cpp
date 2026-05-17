@@ -1,21 +1,20 @@
-// DesktopWallE — ESP-IDF spike for esp-sr VAD on M5 CoreS3.
+// DesktopWallE — ESP-IDF spike, Phase 2: live mic → VADNet on M5 CoreS3.
 //
-// Goal: prove ESP-IDF v5.5.4 + esp-sr VADNet can boot and load on the
-// target hardware. No mic capture, no UI, no WiFi yet — just:
-//   1. Boot, mount NVS.
-//   2. esp_srmodel_init("model") finds the SPIFFS model partition.
-//   3. Resolve the vadnet entry and create a handle.
-//   4. Feed it a deterministic synthetic chunk and print state transitions.
-//   5. Heap accounting before/after to confirm reasonable memory use.
+// Boots, loads vadnet1_medium, opens ES7210 mic over I2S @ 16 kHz mono,
+// then continuously feeds 32 ms frames into VADNet and logs every
+// SPEECH ⇄ SILENCE transition with a timestamp. This is the proof that
+// device-side VAD can replace bridge-side RMS guessing.
 //
-// Once green, the next milestone is wiring it to a real I2S mic feed.
+// Talk into the mic and watch the serial — you should see SILENCE→SPEECH
+// land within ~30–60 ms of voice onset, and SPEECH→SILENCE after the
+// configured min_noise_ms (1 s by default) of trailing quiet.
 
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -26,25 +25,16 @@
 #include "esp_vadn_models.h"
 #include "model_path.h"
 
+#include "mic.h"
+
 static const char *TAG = "vad_spike";
 
-// 16 kHz mono int16 sine burst (~300 Hz @ peak 8000) → should register as
-// VAD_SPEECH. Followed by a chunk of silence → should flip back to
-// VAD_SILENCE within `min_noise_ms`. We synthesize on the fly to avoid
-// shipping a wav file in the spike.
-static void fill_tone(int16_t *buf, size_t samples, int freq_hz,
-                      int sr_hz, int16_t peak) {
-    for (size_t i = 0; i < samples; ++i) {
-        float t = (float)i / (float)sr_hz;
-        buf[i] = (int16_t)(peak * sinf(2.0f * (float)M_PI * (float)freq_hz * t));
-    }
-}
+namespace {
 
-static void fill_silence(int16_t *buf, size_t samples) {
-    memset(buf, 0, samples * sizeof(int16_t));
-}
+constexpr uint32_t kMicSampleRateHz = 16000;
+constexpr int      MIC_GAIN_DB    = 60;   // matches M5Stack stock firmware
 
-static void heap_dump(const char *where) {
+void heap_dump(const char *where) {
     ESP_LOGI(TAG, "[heap @ %s] free internal=%u  free psram=%u  largest internal=%u",
              where,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -52,8 +42,10 @@ static void heap_dump(const char *where) {
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
+}  // namespace
+
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "===== DesktopWallE IDF spike booting =====");
+    ESP_LOGI(TAG, "===== DesktopWallE IDF spike (Phase 2: live mic) =====");
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
 
     {
@@ -66,105 +58,136 @@ extern "C" void app_main(void) {
     }
     heap_dump("post-nvs");
 
-    // ─── esp-sr model partition ─────────────────────────────────────────
+    // ─── esp-sr model + VADNet ──────────────────────────────────────────
     srmodel_list_t *models = esp_srmodel_init("model");
     if (!models) {
-        ESP_LOGE(TAG, "esp_srmodel_init(\"model\") returned NULL — is the "
-                       "`model` partition populated? Re-flash with `idf.py flash`.");
+        ESP_LOGE(TAG, "esp_srmodel_init(\"model\") returned NULL");
         return;
     }
-    ESP_LOGI(TAG, "srmodel partition mounted: %d entries", models->num);
-    for (int i = 0; i < models->num; ++i) {
-        ESP_LOGI(TAG, "  [%d] %s", i, models->model_name[i]);
-    }
-
     char *vadn_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     if (!vadn_name) {
-        ESP_LOGE(TAG, "no VADNet model present. Check sdkconfig: "
-                       "CONFIG_USE_VADNET=y + CONFIG_SR_VADN_CN_VADNET1_MEDIUM=y");
+        ESP_LOGE(TAG, "no VADNet model in partition");
         esp_srmodel_deinit(models);
         return;
     }
-    ESP_LOGI(TAG, "VADNet model selected: %s", vadn_name);
+    ESP_LOGI(TAG, "VADNet model: %s", vadn_name);
 
-    esp_vadn_iface_t *vadnet =
-        (esp_vadn_iface_t *)esp_vadn_handle_from_name(vadn_name);
+    auto *vadnet = (esp_vadn_iface_t *)esp_vadn_handle_from_name(vadn_name);
     if (!vadnet) {
         ESP_LOGE(TAG, "esp_vadn_handle_from_name failed");
         esp_srmodel_deinit(models);
         return;
     }
 
-    // VADNet trigger parameters — match the docs' "common" config:
-    //   min_speech_ms = 128  (drop bursts shorter than this)
-    //   min_noise_ms  = 1000 (1 s of silence to flip back)
-    //   mode          = VAD_MODE_1 (Aggressive)
+    // min_speech_ms=128, min_noise_ms=1000 — the bridge wants ~1 s of
+    // trailing silence to decide "user stopped talking". VAD_MODE_1 is
+    // a balanced sensitivity; if we get false-positives in noisy rooms
+    // bump to MODE_2 or MODE_3.
     model_iface_data_t *model = vadnet->create(vadn_name, VAD_MODE_1, 1, 128, 1000);
     if (!model) {
         ESP_LOGE(TAG, "vadnet->create failed");
         esp_srmodel_deinit(models);
         return;
     }
+    const int frame_samps = vadnet->get_samp_chunksize(model);
+    const int model_sr    = vadnet->get_samp_rate(model);
+    ESP_LOGI(TAG, "VADNet ready: %d Hz × %d samples (%d ms/frame)",
+             model_sr, frame_samps, frame_samps * 1000 / model_sr);
     heap_dump("post-vadnet-create");
 
-    int sr_hz       = vadnet->get_samp_rate(model);
-    int frame_samps = vadnet->get_samp_chunksize(model);
-    ESP_LOGI(TAG, "VADNet ready: sample_rate=%d Hz  frame=%d samples (%d ms)",
-             sr_hz, frame_samps, frame_samps * 1000 / sr_hz);
-
-    // ─── Synthetic test stream: 1.5 s speech (tone) + 1.5 s silence ─────
-    int16_t *buf = (int16_t *)heap_caps_malloc(frame_samps * sizeof(int16_t),
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!buf) {
-        ESP_LOGE(TAG, "OOM allocating frame buffer");
+    if ((uint32_t)model_sr != kMicSampleRateHz) {
+        ESP_LOGE(TAG, "VADNet sample rate %d ≠ mic rate %u — this spike "
+                       "doesn't resample, abort.", model_sr, (unsigned)kMicSampleRateHz);
         vadnet->destroy(model);
         esp_srmodel_deinit(models);
         return;
     }
 
-    const int total_speech_frames  = (sr_hz * 1500 / 1000) / frame_samps;
-    const int total_silence_frames = (sr_hz * 1500 / 1000) / frame_samps;
-    vad_state_t prev = VAD_SILENCE;
-    int speech_first = -1, silence_first = -1;
-
-    ESP_LOGI(TAG, "feeding %d frames of speech, then %d frames of silence",
-             total_speech_frames, total_silence_frames);
-
-    for (int i = 0; i < total_speech_frames; ++i) {
-        fill_tone(buf, frame_samps, 300, sr_hz, 8000);
-        vad_state_t s = vadnet->detect(model, buf);
-        if (s != prev) {
-            ESP_LOGI(TAG, "  frame %4d  state %s → %s", i,
-                     prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
-                     s    == VAD_SPEECH ? "SPEECH" : "SILENCE");
-            if (s == VAD_SPEECH && speech_first < 0) speech_first = i;
-            prev = s;
-        }
+    // ─── Mic ────────────────────────────────────────────────────────────
+    if (mic_init(kMicSampleRateHz, MIC_GAIN_DB) != ESP_OK) {
+        ESP_LOGE(TAG, "mic_init failed");
+        vadnet->destroy(model);
+        esp_srmodel_deinit(models);
+        return;
     }
-    for (int i = 0; i < total_silence_frames; ++i) {
-        fill_silence(buf, frame_samps);
-        vad_state_t s = vadnet->detect(model, buf);
-        if (s != prev) {
-            ESP_LOGI(TAG, "  frame %4d  state %s → %s",
-                     i + total_speech_frames,
-                     prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
-                     s    == VAD_SPEECH ? "SPEECH" : "SILENCE");
-            if (s == VAD_SILENCE && silence_first < 0) silence_first = i;
-            prev = s;
-        }
+    heap_dump("post-mic-init");
+
+    const int nch = mic_channel_count();
+    int16_t *multi = (int16_t *)heap_caps_malloc(frame_samps * nch * sizeof(int16_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *mono  = (int16_t *)heap_caps_malloc(frame_samps * sizeof(int16_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!multi || !mono) {
+        ESP_LOGE(TAG, "OOM mic frame buffer");
+        return;
     }
 
-    ESP_LOGI(TAG, "===== spike result =====");
-    ESP_LOGI(TAG, "  speech-detection lag : %d frames (%d ms)",
-             speech_first, speech_first < 0 ? -1 : speech_first * frame_samps * 1000 / sr_hz);
-    ESP_LOGI(TAG, "  silence-detection lag: %d frames (%d ms after speech ended)",
-             silence_first, silence_first < 0 ? -1 : silence_first * frame_samps * 1000 / sr_hz);
+    ESP_LOGI(TAG, "===== streaming mic → VADNet — %d TDM channels — talk to the device =====", nch);
 
-    free(buf);
-    vadnet->destroy(model);
-    esp_srmodel_deinit(models);
-    heap_dump("post-cleanup");
+    auto rms_of_ch = [&](const int16_t *p, int n_frames, int nch_, int ch) -> int {
+        long long s = 0;
+        for (int i = 0; i < n_frames; ++i) {
+            int v = p[i * nch_ + ch];
+            s += (long long)v * v;
+        }
+        return (int)(s / (n_frames > 0 ? n_frames : 1));
+    };
+    auto absmax_of_ch = [&](const int16_t *p, int n_frames, int nch_, int ch) -> int {
+        int m = 0;
+        for (int i = 0; i < n_frames; ++i) {
+            int v = p[i * nch_ + ch];
+            int a = v < 0 ? -v : v;
+            if (a > m) m = a;
+        }
+        return m;
+    };
 
-    ESP_LOGI(TAG, "spike done; idling forever");
-    while (true) vTaskDelay(pdMS_TO_TICKS(60000));
+    vad_state_t prev    = VAD_SILENCE;
+    int64_t     t0_us   = esp_timer_get_time();
+    int         frames  = 0;
+    int         speech_frames = 0;
+    int         heartbeat_period = 1000 / (frame_samps * 1000 / model_sr);   // ≈31 frames
+
+    while (true) {
+        int got = mic_read_multi(multi, frame_samps);
+        if (got <= 0) {
+            ESP_LOGE(TAG, "mic_read_multi returned %d, retrying", got);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        // De-interleave ch0 → mono buffer for VADNet feed
+        for (int i = 0; i < frame_samps; ++i) mono[i] = multi[i * nch];
+
+        vad_state_t cur = vadnet->detect(model, mono);
+        ++frames;
+        if (cur == VAD_SPEECH) ++speech_frames;
+
+        if (cur != prev) {
+            int64_t ms_since_boot = (esp_timer_get_time() - t0_us) / 1000;
+            ESP_LOGI(TAG, ">>> t=%6lld ms  frame=%5d  %-7s → %-7s",
+                     ms_since_boot, frames,
+                     prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
+                     cur  == VAD_SPEECH ? "SPEECH" : "SILENCE");
+            prev = cur;
+        }
+
+        // 1 Hz heartbeat — log RMS+peak for every channel so we can see
+        // which TDM slot has the actual mic input.
+        if ((frames % heartbeat_period) == 0) {
+            char chinfo[200] = {0};
+            int  off         = 0;
+            for (int c = 0; c < nch; ++c) {
+                int r = rms_of_ch(multi, frame_samps, nch, c);
+                int p = absmax_of_ch(multi, frame_samps, nch, c);
+                off += snprintf(chinfo + off, sizeof(chinfo) - off,
+                                "  ch%d[rms=%d peak=%d]", c, r, p);
+            }
+            ESP_LOGI(TAG, "[hb] t=%6lld ms  frames=%d  state=%s  speech_pct=%.1f%% %s",
+                     (esp_timer_get_time() - t0_us) / 1000,
+                     frames,
+                     cur == VAD_SPEECH ? "SPEECH" : "SILENCE",
+                     100.0 * speech_frames / frames,
+                     chinfo);
+        }
+    }
 }

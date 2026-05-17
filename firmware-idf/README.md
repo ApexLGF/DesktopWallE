@@ -83,19 +83,65 @@ Two gotchas worth recording for the next person:
    zip file". We work around this by `EXTRA_COMPONENT_DIRS` to a local
    esp-sr checkout (see root `CMakeLists.txt`).
 
-## Next phases (after this spike)
+## Phase 2 — live mic → VADNet (2026-05-17, partial)
 
-- **Phase 2**: hook up real I2S mic input (CoreS3 onboard NS4168 dual
-  mic), replace the synthetic tone with live PCM, watch
-  SILENCE→SPEECH→SILENCE transitions in serial.
-- **Phase 3**: wire the bridge — send `mic.start` from bridge, stream
-  raw PCM up via ws binary frames (the existing ocsc.v2 protocol), have
-  device emit `mic.end` event when VADNet detects 1 s of trailing
-  silence. Bridge's `_capture_utterance` already waits on `mic.end`, so
-  no bridge changes needed.
-- **Phase 4**: decide whether to fold the rest of the firmware
-  (servos, LCD, LEDs, 34 HTTP endpoints) into this IDF project or keep
-  the two-firmware setup.
+Wired the ES7210 mic ADC over I2S into the existing VADNet loop. Whole
+pipeline boots, no crashes. ES7210 reports `Unmuted` and the codec
+opens cleanly. **But the mic levels are pinned at the noise floor** —
+peak ≈ ±250 in int16 even when the user is speaking inches from the
+device. Channel breakdown over a 25 s capture with user speaking:
+
+| TDM slot | RMS range | Peak | Notes |
+|----------|-----------|------|-------|
+| ch0 | 1700–8200 | 130–345 | noise only — no response to speech |
+| ch1 | 270–470   | 43–75   | near zero |
+| ch2 | 1800–7800 | 130–310 | mirrors ch0 |
+| ch3 | 0         | 1–2     | dead |
+
+Normal speech at desk distance should produce peak ≥ ±2000 (-24 dBFS).
+We're 20 dB below that with no dependence on whether the user is
+talking. VADNet did fire once at t=23.7 s on what was clearly noise —
+likely a false positive on the (already weak) ambient signal.
+
+**Root cause: missing PMU bringup.**
+
+CoreS3 power architecture:
+
+```
+AXP2101 PMU (I2C 0x34)
+  ├─ ALDO1 → camera VDDIO 1.8 V
+  ├─ ALDO2 → 3.3 V peripheral
+  ├─ ALDO3 → 3.3 V mic/camera ANALOG  ← need this on for ES7210 PGA
+  └─ ALDO4 → 3.3 V LCD
+
+AW9523 GPIO expander (I2C 0x58)
+  ├─ P0.0 → AW88298 enable (speaker amp)
+  ├─ P0.1 → camera power-down (negated)
+  ├─ P1.5 → 5 V boost for USB out
+  └─ P1.6 → ES7210 enable / reset  ← need this high
+```
+
+We skipped both: AXP2101 was never touched (audio chip got its digital
+supply via USB-VBUS pass-through which is enough for I²C to respond, so
+init "succeeds" and you don't see I2C NACKs — but the analog preamp is
+starved). AW9523 was never touched either.
+
+M5Stack stock firmware does this in their HAL init *before* the audio
+codec is created. We need to do the same.
+
+## Next phases
+
+- **Phase 2.5 (one session)**: write minimal `pmu_init()` — direct I²C
+  writes to AXP2101 + AW9523 to enable ALDO3 + P1.6. Should be ~100
+  lines of C. After this, mic levels should be normal and VADNet
+  transitions should track real speech reliably.
+- **Phase 3**: hook the device into the bridge via ws (ocsc.v2). Send
+  `mic.start`, stream PCM up as KIND_MIC_PCM binary frames, fire
+  `mic.end` evt when VADNet detects 1 s of trailing silence. The bridge
+  side already waits for `mic.end`, no changes needed.
+- **Phase 4**: decide whether to fold the rest of the firmware (servos,
+  LCD, LEDs, 34 HTTP endpoints) into the IDF project or keep two
+  firmwares.
 
 ## Why VADNet not lightweight VAD
 

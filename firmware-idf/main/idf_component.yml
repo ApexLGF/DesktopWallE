@@ -7,3 +7,7 @@ dependencies:
   idf: ">=5.5,<5.6"
   espressif/esp-dsp: "^1.8"
   espressif/dl_fft: ">=0.2"
+  # ES7210 (mic ADC) + AW88298 (speaker amp) abstraction. Pulls the
+  # ES7210 driver + I2S audio data interface in one package. CoreS3
+  # has both chips on the I2C bus at the default addresses.
+  espressif/esp_codec_dev: "~1.5.4"
