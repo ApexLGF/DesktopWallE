@@ -38,6 +38,7 @@ bool g_hello_acked    = false;
 bool g_mic_streaming  = false;
 uint16_t g_mic_sid    = 0;
 uint32_t g_mic_seq    = 0;
+volatile bool g_saw_speech = false;   // any SPEECH frame observed this turn?
 uint16_t g_tts_sid    = 0;
 uint32_t g_tts_seq    = 0;
 bool     g_tts_in_flight = false;
@@ -116,6 +117,7 @@ void handle_req(cJSON *root) {
         g_mic_sid       = sid;
         g_mic_seq       = 0;
         g_mic_streaming = true;
+        g_saw_speech    = false;
         send_res_ok(rpc_id, nullptr);
         char buf[96];
         snprintf(buf, sizeof(buf),
@@ -126,10 +128,22 @@ void handle_req(cJSON *root) {
         lcd_set_state(LCD_STATE_LISTENING);
         ESP_LOGI(TAG, "mic streaming on, sid=%u (LCD=LISTEN)", (unsigned)sid);
     } else if (strcmp(method, "mic_stop") == 0) {
+        bool was_streaming = g_mic_streaming;
+        bool had_speech    = g_saw_speech;
         g_mic_streaming = false;
-        lcd_set_state(LCD_STATE_HEARD);
         send_res_ok(rpc_id, nullptr);
-        ESP_LOGI(TAG, "mic streaming off (server stop, LCD=HEARD)");
+        if (was_streaming && !had_speech) {
+            // The bridge timed out a LISTEN window with no speech at all.
+            // Don't claim "HEARD" — fall back to IDLE so the user sees
+            // the device is dormant, and emit `evt mic.timeout reason=no_speech`
+            // so bridge logic can stop auto-cycling LISTEN.
+            lcd_set_state(LCD_STATE_IDLE);
+            send_text("{\"t\":\"evt\",\"name\":\"mic.timeout\",\"d\":{\"reason\":\"no_speech\"}}");
+            ESP_LOGI(TAG, "mic streaming off (server stop, no speech → LCD=IDLE)");
+        } else {
+            lcd_set_state(LCD_STATE_HEARD);
+            ESP_LOGI(TAG, "mic streaming off (server stop, LCD=HEARD)");
+        }
     } else if (strcmp(method, "show_text") == 0) {
         // Bridge sends rich text we don't fully render yet — peek at the
         // title to infer agent state and update the LCD color accordingly.
@@ -322,6 +336,7 @@ void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_da
 
 bool bridge_ws_is_connected(void)   { return g_connected && g_hello_acked; }
 bool bridge_ws_mic_streaming(void)  { return bridge_ws_is_connected() && g_mic_streaming; }
+void bridge_ws_mark_speech_observed(void) { if (g_mic_streaming) g_saw_speech = true; }
 
 esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
                            const char *device_id, uint32_t boot_count,

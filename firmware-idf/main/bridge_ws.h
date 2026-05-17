@@ -48,6 +48,13 @@ void bridge_ws_send_mic_pcm(const int16_t *samples, size_t n_samples);
 // mic is open.
 void bridge_ws_signal_speech_end(const char *reason);
 
+// Mark that VAD observed at least one SPEECH frame during the current
+// LISTEN turn. Called by the mic loop on every SILENCE→SPEECH edge.
+// Cheap: just sets a volatile bool. Lets the `mic_stop` handler tell
+// "the user spoke and stopped" apart from "bridge timed out without
+// any speech" so the LCD doesn't lie about HEARD.
+void bridge_ws_mark_speech_observed(void);
+
 // Emit `evt tts.done sid=<sid>` to the bridge. Called by speaker.cpp
 // when the playback queue has drained past its end-of-utterance
 // sentinel. Lets the bridge release its tts_lock and stop suppressing

@@ -271,6 +271,11 @@ extern "C" void app_main(void) {
                      prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
                      cur  == VAD_SPEECH ? "SPEECH" : "SILENCE",
                      bridge_ws_is_connected(), bridge_ws_mic_streaming());
+            // SILENCE→SPEECH: tag the turn as "user actually spoke" so the
+            // mic_stop handler can pick HEARD vs IDLE correctly.
+            if (prev == VAD_SILENCE && cur == VAD_SPEECH) {
+                bridge_ws_mark_speech_observed();
+            }
             // SPEECH→SILENCE while streaming = end-of-utterance.
             if (prev == VAD_SPEECH && cur == VAD_SILENCE && bridge_ws_mic_streaming()) {
                 bridge_ws_signal_speech_end("vad");
