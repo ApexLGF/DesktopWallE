@@ -54,6 +54,12 @@ void bridge_ws_signal_speech_end(const char *reason);
 // mic input.
 void bridge_ws_send_tts_done(uint16_t sid);
 
+// Emit `evt wake word=<word>` to the bridge. Called by the mic loop
+// when esp-sr's WakeNet fires on the live mic stream. Bridge's
+// voice_loop will pick this up and start a new conversation turn,
+// equivalent to a manual /voice POST.
+void bridge_ws_send_wake_event(const char *word);
+
 #ifdef __cplusplus
 }
 #endif

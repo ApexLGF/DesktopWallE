@@ -31,6 +31,8 @@
 #include "esp_vad.h"
 #include "esp_vadn_iface.h"
 #include "esp_vadn_models.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
 #include "model_path.h"
 
 #include "mic.h"
@@ -113,7 +115,7 @@ extern "C" void app_main(void) {
     load_device_id_and_boot(device_id, sizeof(device_id), &boot_count);
     ESP_LOGI(TAG, "device: %s  boot=%lu", device_id, (unsigned long)boot_count);
 
-    // ─── VADNet ─────────────────────────────────────────────────────────
+    // ─── VADNet + WakeNet ───────────────────────────────────────────────
     srmodel_list_t *models = esp_srmodel_init("model");
     if (!models) { ESP_LOGE(TAG, "srmodel_init failed"); return; }
     char *vadn_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
@@ -123,6 +125,26 @@ extern "C" void app_main(void) {
     const int model_sr    = vadnet->get_samp_rate(model);
     ESP_LOGI(TAG, "VADNet: %d Hz × %d samples (%d ms)", model_sr, frame_samps,
              frame_samps * 1000 / model_sr);
+
+    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
+    esp_wn_iface_t      *wakenet  = nullptr;
+    model_iface_data_t  *wn_model = nullptr;
+    int                  wn_chunk = 0;
+    if (wn_name) {
+        wakenet  = (esp_wn_iface_t *)esp_wn_handle_from_name(wn_name);
+        wn_model = wakenet->create(wn_name, DET_MODE_90);
+        wn_chunk = wakenet->get_samp_chunksize(wn_model);
+        // Default threshold from the model file is ~0.63 which is tuned for
+        // clean AFE-processed audio. We feed raw mic (75 dB gain, no AEC/NS),
+        // so lower the threshold to compensate for the noisier input. Trade
+        // false-accepts here for never-fires.
+        wakenet->set_det_threshold(wn_model, 0.4f, 1);
+        float thr = wakenet->get_det_threshold(wn_model, 1);
+        ESP_LOGI(TAG, "WakeNet: model=%s chunk=%d threshold=%.2f — \"Hi Wall-E\"",
+                 wn_name, wn_chunk, thr);
+    } else {
+        ESP_LOGW(TAG, "no WakeNet model in flash — hands-free wake disabled");
+    }
 
     // ─── I2C bus + PMU + Mic ────────────────────────────────────────────
     i2c_master_bus_handle_t i2c_bus = nullptr;
@@ -208,6 +230,21 @@ extern "C" void app_main(void) {
 
         vad_state_t cur = vadnet->detect(model, mono);
         ++frames;
+
+        // WakeNet runs only when we're truly idle: NOT mid-recording AND
+        // NOT mid-playback. Without the speaker_is_active guard, every
+        // TTS reply re-triggers wake on the mic capturing the speaker's
+        // own audio bleed — which both wastes CPU (audible stuttering)
+        // and makes the LCD flip between TALK/LISTEN. xiaozhi handles
+        // this with proper AEC; we skip the issue by simply pausing.
+        if (wakenet && wn_model && wn_chunk == frame_samps &&
+                !bridge_ws_mic_streaming() && !speaker_is_active()) {
+            int idx = wakenet->detect(wn_model, mono);
+            if (idx > 0) {
+                ESP_LOGI(TAG, "🎤 WAKE detected (idx=%d)", idx);
+                bridge_ws_send_wake_event("hi_walle");
+            }
+        }
 
         if (cur != prev) {
             int64_t ms = (esp_timer_get_time() - t0_us) / 1000;

@@ -37,6 +37,11 @@ CONFIG_MODEL_IN_FLASH=y
 CONFIG_AFE_INTERFACE_V1=y
 CONFIG_SR_VADN_VADNET1_MEDIUM=y
 
+# WakeNet "Hi Wall-E" / "Hi 瓦力" — offline keyword spotting on the
+# mic stream. Bridge already routes evt name=wake into voice_loop, so
+# emitting this from the device gives us hands-free conversation.
+CONFIG_SR_WN_WN9_HIWALLE_TTS2=y
+
 # ─── Logging ─────────────────────────────────────────────────────────────
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y

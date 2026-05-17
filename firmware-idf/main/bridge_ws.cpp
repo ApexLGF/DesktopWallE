@@ -60,6 +60,7 @@ void send_hello() {
     cJSON *caps = cJSON_CreateArray();
     cJSON_AddItemToArray(caps, cJSON_CreateString("listen"));
     cJSON_AddItemToArray(caps, cJSON_CreateString("vad"));
+    cJSON_AddItemToArray(caps, cJSON_CreateString("wake"));
     cJSON_AddItemToObject(o, "caps", caps);
     char *json = cJSON_PrintUnformatted(o);
     esp_websocket_client_send_text(g_client, json, strlen(json), portMAX_DELAY);
@@ -337,7 +338,7 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     cfg.uri                       = uri;
     cfg.reconnect_timeout_ms      = 5000;
     cfg.network_timeout_ms        = 10000;
-    cfg.buffer_size               = 16384;   // 8 chunks at 1920 B/each — absorbs bursts
+    cfg.buffer_size               = 4096;    // OPUS packets are <200 B; this is plenty
     // Default 4 KB task stack overflows when we mix cJSON + send_bin
     // + event handler in the same task at 31 fps. 8 KB has comfortable
     // margin.
@@ -380,9 +381,10 @@ void bridge_ws_send_mic_pcm(const int16_t *samples, size_t n_samples) {
     buf[7] = (uint8_t)((g_mic_seq >> 24) & 0xFF);
     memcpy(buf + BINARY_HEADER_LEN, samples, payload_bytes);
     int sent = esp_websocket_client_send_bin(
-        g_client, (const char *)buf, total, pdMS_TO_TICKS(200));
+        g_client, (const char *)buf, total, pdMS_TO_TICKS(1000));
     if (sent < 0) {
-        ESP_LOGW(TAG, "send_bin failed (%d)", sent);
+        ESP_LOGW(TAG, "send_bin seq=%lu failed (%d) — dropping",
+                 (unsigned long)g_mic_seq, sent);
         return;
     }
     ++g_mic_seq;
@@ -410,4 +412,14 @@ void bridge_ws_send_tts_done(uint16_t sid) {
              (unsigned)sid);
     send_text(buf);
     ESP_LOGI(TAG, "→ evt tts.done sid=%u", (unsigned)sid);
+}
+
+void bridge_ws_send_wake_event(const char *word) {
+    if (!bridge_ws_is_connected()) return;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"t\":\"evt\",\"name\":\"wake\",\"d\":{\"word\":\"%s\"}}",
+             word ? word : "wake");
+    send_text(buf);
+    ESP_LOGI(TAG, "→ evt wake word=%s", word ? word : "wake");
 }
