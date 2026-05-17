@@ -20,12 +20,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+
 #include "esp_vad.h"
 #include "esp_vadn_iface.h"
 #include "esp_vadn_models.h"
 #include "model_path.h"
 
 #include "mic.h"
+#include "pmu.h"
 
 static const char *TAG = "vad_spike";
 
@@ -103,8 +107,28 @@ extern "C" void app_main(void) {
         return;
     }
 
+    // ─── Shared I2C bus on port 1, SDA=12, SCL=11 (CoreS3 wiring) ──────
+    i2c_master_bus_handle_t i2c_bus = nullptr;
+    {
+        i2c_master_bus_config_t bus_cfg = {};
+        bus_cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
+        bus_cfg.i2c_port                     = I2C_NUM_1;
+        bus_cfg.scl_io_num                   = GPIO_NUM_11;
+        bus_cfg.sda_io_num                   = GPIO_NUM_12;
+        bus_cfg.glitch_ignore_cnt            = 7;
+        bus_cfg.flags.enable_internal_pullup = true;
+        ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
+    }
+
+    // ─── PMU bringup (AXP2101 + AW9523) ─ MUST happen before mic init. ──
+    if (pmu_init(i2c_bus) != ESP_OK) {
+        ESP_LOGE(TAG, "pmu_init failed — mic analog rail will be off");
+    }
+    // Give the rails a beat to come up before we touch the codec.
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     // ─── Mic ────────────────────────────────────────────────────────────
-    if (mic_init(kMicSampleRateHz, MIC_GAIN_DB) != ESP_OK) {
+    if (mic_init(i2c_bus, kMicSampleRateHz, MIC_GAIN_DB) != ESP_OK) {
         ESP_LOGE(TAG, "mic_init failed");
         vadnet->destroy(model);
         esp_srmodel_deinit(models);

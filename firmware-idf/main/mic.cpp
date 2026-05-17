@@ -35,7 +35,7 @@ constexpr gpio_num_t       I2S_DIN      = GPIO_NUM_14;
 
 constexpr uint8_t          ES7210_ADDR  = ES7210_CODEC_DEFAULT_ADDR;
 
-i2c_master_bus_handle_t      g_i2c_bus     = nullptr;
+i2c_master_bus_handle_t      g_i2c_bus     = nullptr;  // borrowed, not owned
 i2s_chan_handle_t            g_i2s_rx      = nullptr;
 const audio_codec_data_if_t *g_data_if     = nullptr;
 const audio_codec_ctrl_if_t *g_ctrl_if     = nullptr;
@@ -45,22 +45,14 @@ int                          g_channels    = 1;
 
 }  // namespace
 
-esp_err_t mic_init(uint32_t sample_rate_hz, int input_gain_db) {
-    // ─── I2C bus (shared with PMIC / speaker amp later) ─────────────────
-    {
-        i2c_master_bus_config_t cfg = {};
-        cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
-        cfg.i2c_port                     = I2C_PORT;
-        cfg.scl_io_num                   = I2C_SCL;
-        cfg.sda_io_num                   = I2C_SDA;
-        cfg.glitch_ignore_cnt            = 7;
-        cfg.flags.enable_internal_pullup = true;
-        esp_err_t err = i2c_new_master_bus(&cfg, &g_i2c_bus);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
-            return err;
-        }
+esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
+                    uint32_t sample_rate_hz,
+                    int      input_gain_db) {
+    if (!i2c_bus) {
+        ESP_LOGE(TAG, "mic_init: i2c_bus is null — call pmu_init() first to set up I2C");
+        return ESP_ERR_INVALID_ARG;
     }
+    g_i2c_bus = i2c_bus;
 
     // ─── I2S channel — RX only, TDM mode (ES7210 is TDM-only) ──────────
     {
@@ -232,8 +224,6 @@ void mic_deinit(void) {
         i2s_del_channel(g_i2s_rx);
         g_i2s_rx = nullptr;
     }
-    if (g_i2c_bus) {
-        i2c_del_master_bus(g_i2c_bus);
-        g_i2c_bus = nullptr;
-    }
+    // i2c_bus is borrowed from caller — don't free it here.
+    g_i2c_bus = nullptr;
 }

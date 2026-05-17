@@ -14,14 +14,19 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "driver/i2c_master.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// One-shot init. Returns ESP_OK on success, an esp_err_t on failure
-// (logged via ESP_LOGE — caller should treat as fatal for the spike).
-esp_err_t mic_init(uint32_t sample_rate_hz, int input_gain_db);
+// One-shot init. Pass the shared I2C bus handle so the codec sits on
+// the same bus as the PMU (we don't want two masters on the same pins).
+// Returns ESP_OK on success, an esp_err_t on failure (logged via
+// ESP_LOGE — caller should treat as fatal for the spike).
+esp_err_t mic_init(i2c_master_bus_handle_t i2c_bus,
+                    uint32_t sample_rate_hz,
+                    int      input_gain_db);
 
 // Blocking read of `n_samples` int16_t samples (mono). Returns the
 // number of samples actually read; <0 on error.
