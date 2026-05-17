@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
@@ -33,10 +34,59 @@ constexpr gpio_num_t  PIN_DC   = GPIO_NUM_35;
 
 constexpr int W = 320;
 constexpr int H = 240;
+constexpr int BAND_H = 30;     // 320*30*2 = 19.2 KB per SPI shadow alloc
 
-esp_lcd_panel_handle_t g_panel = nullptr;
-uint16_t              *g_fb    = nullptr;     // PSRAM framebuffer, RGB565 BE
-lcd_state_t            g_state = LCD_STATE_BOOT;
+esp_lcd_panel_handle_t    g_panel     = nullptr;
+esp_lcd_panel_io_handle_t g_io        = nullptr;
+SemaphoreHandle_t         g_trans_sem = nullptr;  // released by on_color_trans_done
+uint16_t                 *g_fb        = nullptr;     // PSRAM framebuffer, RGB565 BE
+lcd_state_t               g_state     = LCD_STATE_BOOT;
+
+// Called from ISR when esp_lcd has finished pushing the last byte of a
+// queued draw_bitmap. Lets us block the next paint until the bus is idle
+// instead of guessing with a fixed sleep — which was racing the SPI queue
+// and silently dropping subsequent draws.
+bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t,
+                                    esp_lcd_panel_io_event_data_t *,
+                                    void *) {
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(g_trans_sem, &hpw);
+    return hpw == pdTRUE;
+}
+
+// Push the framebuffer to the panel in horizontal bands. A single
+// 320×240×2 = 153.6 KB transaction forces spi_master to allocate an
+// equally-large shadow buffer in DMA-capable internal RAM (the
+// framebuffer is in PSRAM, which the bus can't DMA from in this
+// config). Under steady load that alloc fails — setup_dma_priv_buffer
+// — and the paint is dropped. 30 rows = 19.2 KB per chunk fits even
+// under heavy heap fragmentation. Bands are sent serially, gated on
+// `g_trans_sem`, leaving the sem in "available" state at return so the
+// next lcd_set_state can immediately take it.
+esp_err_t draw_fb_banded() {
+    for (int y = 0; y < H; y += BAND_H) {
+        int h = (y + BAND_H > H) ? (H - y) : BAND_H;
+        if (xSemaphoreTake(g_trans_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            ESP_LOGW(TAG, "band y=%d: sem timeout", y);
+            xSemaphoreGive(g_trans_sem);
+            return ESP_ERR_TIMEOUT;
+        }
+        esp_err_t err = esp_lcd_panel_draw_bitmap(g_panel, 0, y, W, y + h,
+                                                    g_fb + y * W);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "band y=%d draw_bitmap: %s", y, esp_err_to_name(err));
+            xSemaphoreGive(g_trans_sem);
+            return err;
+        }
+    }
+    // Wait for the last band's callback so subsequent set_state finds
+    // the sem available without an extra wait.
+    if (xSemaphoreTake(g_trans_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "final band wait: sem timeout");
+    }
+    xSemaphoreGive(g_trans_sem);
+    return ESP_OK;
+}
 
 // Mini 5×7 ASCII font, only the characters we actually use.
 // LSB-first bytes; 5 bits wide. Stored as 7 bytes per glyph.
@@ -165,23 +215,27 @@ esp_err_t lcd_init(void) {
     esp_err_t err = spi_bus_initialize(SPI_HOST_LCD, &bus, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) { ESP_LOGE(TAG, "spi_bus_initialize: %s", esp_err_to_name(err)); return err; }
 
-    esp_lcd_panel_io_handle_t io = nullptr;
     esp_lcd_panel_io_spi_config_t io_cfg = {};
     io_cfg.cs_gpio_num     = PIN_CS;
     io_cfg.dc_gpio_num     = PIN_DC;
     io_cfg.spi_mode        = 2;
     io_cfg.pclk_hz         = 40 * 1000 * 1000;
-    io_cfg.trans_queue_depth = 4;
+    io_cfg.trans_queue_depth = 4;   // bands are sent serially, queue=4 is plenty
     io_cfg.lcd_cmd_bits    = 8;
     io_cfg.lcd_param_bits  = 8;
-    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI_HOST_LCD, &io_cfg, &io);
+    io_cfg.on_color_trans_done = on_color_trans_done;
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI_HOST_LCD, &io_cfg, &g_io);
     if (err != ESP_OK) { ESP_LOGE(TAG, "panel_io_spi: %s", esp_err_to_name(err)); return err; }
+
+    g_trans_sem = xSemaphoreCreateBinary();
+    if (!g_trans_sem) { ESP_LOGE(TAG, "OOM trans sem"); return ESP_ERR_NO_MEM; }
+    xSemaphoreGive(g_trans_sem);  // first paint can proceed immediately
 
     esp_lcd_panel_dev_config_t panel_cfg = {};
     panel_cfg.reset_gpio_num = -1;  // AW9523 handles reset; we did the init seq there
     panel_cfg.rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR;
     panel_cfg.bits_per_pixel = 16;
-    err = esp_lcd_new_panel_ili9341(io, &panel_cfg, &g_panel);
+    err = esp_lcd_new_panel_ili9341(g_io, &panel_cfg, &g_panel);
     if (err != ESP_OK) { ESP_LOGE(TAG, "new_panel_ili9341: %s", esp_err_to_name(err)); return err; }
 
     esp_lcd_panel_reset(g_panel);
@@ -192,7 +246,10 @@ esp_err_t lcd_init(void) {
     esp_lcd_panel_disp_on_off(g_panel, true);
 
     render_state(LCD_STATE_BOOT);
-    esp_lcd_panel_draw_bitmap(g_panel, 0, 0, W, H, g_fb);
+    err = draw_fb_banded();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "first banded paint: %s", esp_err_to_name(err));
+    }
     ESP_LOGI(TAG, "lcd ready (%dx%d)", W, H);
     return ESP_OK;
 }
@@ -202,18 +259,9 @@ void lcd_set_state(lcd_state_t s) {
     if (s == g_state) return;
     g_state = s;
     render_state(s);
-    // Throttle: 320*240*2 = 153.6 KB at 40 MHz SPI ≈ 32 ms. If callers
-    // hammer state changes faster than that the panel_io queue fills
-    // and the next draw_bitmap fails with EAGAIN. 50 ms is a safe pad.
-    static int64_t last_paint_us = 0;
-    int64_t now_us = esp_timer_get_time();
-    int64_t since  = now_us - last_paint_us;
-    if (since < 50000) vTaskDelay(pdMS_TO_TICKS((50000 - since) / 1000));
-    last_paint_us = esp_timer_get_time();
-    esp_err_t err = esp_lcd_panel_draw_bitmap(g_panel, 0, 0, W, H, g_fb);
+    esp_err_t err = draw_fb_banded();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "draw_bitmap %s — will retry on next state change",
-                 esp_err_to_name(err));
+        ESP_LOGW(TAG, "state %d banded paint: %s", (int)s, esp_err_to_name(err));
     }
     ESP_LOGI(TAG, "state → %d", (int)s);
 }
