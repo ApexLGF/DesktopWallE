@@ -17,6 +17,7 @@
 
 #include "lcd.h"
 #include "speaker.h"
+#include "led.h"
 
 static const char *TAG = "bridge_ws";
 
@@ -140,7 +141,23 @@ void handle_req(cJSON *root) {
             //   "回复"   → SPEAKING   "请讲"   → LISTENING
             //   "继续吗" → LISTENING
             //   anything else → leave state untouched
-            if      (strstr(t, "\xe6\x80\x9d\xe8\x80\x83")) lcd_set_state(LCD_STATE_THINKING);
+            if (strstr(t, "\xe6\x80\x9d\xe8\x80\x83")) {
+                lcd_set_state(LCD_STATE_THINKING);
+                // Title is like "思考中… 5秒" — pull the digits out so we
+                // can render the counter on the panel under "THINK".
+                int sec = -1;
+                for (const char *p = t; *p; ++p) {
+                    if (*p >= '0' && *p <= '9') {
+                        sec = 0;
+                        while (*p >= '0' && *p <= '9') {
+                            sec = sec * 10 + (*p - '0');
+                            ++p;
+                        }
+                        break;
+                    }
+                }
+                if (sec >= 0) lcd_set_think_elapsed(sec);
+            }
             else if (strstr(t, "\xe5\xb7\xb2\xe5\x90\xac")) lcd_set_state(LCD_STATE_HEARD);
             else if (strstr(t, "\xe5\x9b\x9e\xe5\xa4\x8d")) lcd_set_state(LCD_STATE_SPEAKING);
             else if (strstr(t, "\xe8\xaf\xb7\xe8\xae\xb2") ||
@@ -149,6 +166,24 @@ void handle_req(cJSON *root) {
         send_res_ok(rpc_id, nullptr);
     } else if (strcmp(method, "ping") == 0) {
         send_res_ok(rpc_id, nullptr);
+    } else if (strcmp(method, "set_led") == 0) {
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        if (!p_j) { send_res_err(rpc_id, "bad_params", "missing p"); return; }
+        const cJSON *r_j = cJSON_GetObjectItemCaseSensitive(p_j, "r");
+        const cJSON *g_j = cJSON_GetObjectItemCaseSensitive(p_j, "g");
+        const cJSON *b_j = cJSON_GetObjectItemCaseSensitive(p_j, "b");
+        const cJSON *i_j = cJSON_GetObjectItemCaseSensitive(p_j, "index");
+        uint8_t r = cJSON_IsNumber(r_j) ? (uint8_t)r_j->valueint : 0;
+        uint8_t g = cJSON_IsNumber(g_j) ? (uint8_t)g_j->valueint : 0;
+        uint8_t b = cJSON_IsNumber(b_j) ? (uint8_t)b_j->valueint : 0;
+        esp_err_t err;
+        if (cJSON_IsNumber(i_j)) {
+            err = led_set_pixel((uint8_t)i_j->valueint, r, g, b);
+        } else {
+            err = led_set_all(r, g, b);
+        }
+        if (err == ESP_OK) send_res_ok(rpc_id, nullptr);
+        else               send_res_err(rpc_id, "led_failed", esp_err_to_name(err));
     } else {
         // set_led / motion / display.image / wake_resume etc. — ack-with-err
         // so the bridge doesn't hang waiting for a response.

@@ -39,6 +39,7 @@
 #include "bridge_ws.h"
 #include "lcd.h"
 #include "speaker.h"
+#include "led.h"
 
 // Re-use the Arduino firmware's config so SSID / bridge host live in
 // one place. (gitignored)
@@ -136,6 +137,9 @@ extern "C" void app_main(void) {
         ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &i2c_bus));
     }
     pmu_init(i2c_bus);
+    if (led_init(i2c_bus) != ESP_OK) {
+        ESP_LOGW(TAG, "led init failed — RGB ring will stay dark");
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
     if (mic_init(i2c_bus, kMicSampleRateHz, kMicGainDb) != ESP_OK) {
         ESP_LOGE(TAG, "mic_init failed");

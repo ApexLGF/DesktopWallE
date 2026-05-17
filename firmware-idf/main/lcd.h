@@ -28,6 +28,12 @@ typedef enum {
 esp_err_t lcd_init(void);
 void      lcd_set_state(lcd_state_t s);
 
+// While in THINKING state, render the elapsed seconds counter (the bridge
+// pushes `show_text {title:"思考中… Ns秒"}` every 2 s while Hermes runs).
+// `seconds` < 0 clears the counter. Calling outside THINKING state is a
+// no-op so we don't accidentally repaint over a fresher transition.
+void      lcd_set_think_elapsed(int seconds);
+
 #ifdef __cplusplus
 }
 #endif

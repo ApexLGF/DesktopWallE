@@ -117,6 +117,16 @@ constexpr Glyph FONT[] = {
     {'W', {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}},
     {'!', {0x04,0x04,0x04,0x04,0x04,0x00,0x04}},
     {'.', {0x00,0x00,0x00,0x00,0x00,0x00,0x04}},
+    {'0', {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
+    {'1', {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
+    {'2', {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}},
+    {'3', {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}},
+    {'4', {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
+    {'5', {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}},
+    {'6', {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}},
+    {'7', {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
+    {'8', {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
+    {'9', {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}},
 };
 
 const uint8_t *glyph_rows(char c) {
@@ -182,6 +192,8 @@ Style style_for(lcd_state_t s) {
     return { 0, 0, 0, "" };
 }
 
+int g_think_elapsed = -1;   // seconds; <0 = hide
+
 void render_state(lcd_state_t s) {
     Style sty = style_for(s);
     fb_fill(rgb565(sty.r, sty.g, sty.b));
@@ -191,8 +203,15 @@ void render_state(lcd_state_t s) {
         for (int x = 0; x < W; ++x) { g_fb[i * W + x] = white; g_fb[(H - 1 - i) * W + x] = white; }
         for (int y = 0; y < H; ++y) { g_fb[y * W + i] = white; g_fb[y * W + W - 1 - i] = white; }
     }
-    // Status word — big scale (8) centered roughly mid-screen.
-    fb_text_centered(sty.label, 95, 8, white);
+    // Status word — big scale (8) centered around y=65 so we have room
+    // for an elapsed-seconds counter underneath when state == THINKING.
+    int label_y = (s == LCD_STATE_THINKING && g_think_elapsed >= 0) ? 55 : 95;
+    fb_text_centered(sty.label, label_y, 8, white);
+    if (s == LCD_STATE_THINKING && g_think_elapsed >= 0) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%dS", g_think_elapsed);
+        fb_text_centered(buf, 170, 5, white);
+    }
 }
 
 }  // namespace
@@ -254,10 +273,26 @@ esp_err_t lcd_init(void) {
     return ESP_OK;
 }
 
+void lcd_set_think_elapsed(int seconds) {
+    if (!g_panel) return;
+    if (g_state != LCD_STATE_THINKING) {
+        g_think_elapsed = -1;
+        return;
+    }
+    if (seconds == g_think_elapsed) return;
+    g_think_elapsed = seconds;
+    render_state(g_state);
+    esp_err_t err = draw_fb_banded();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "think tick %ds banded paint: %s", seconds, esp_err_to_name(err));
+    }
+}
+
 void lcd_set_state(lcd_state_t s) {
     if (!g_panel) return;
     if (s == g_state) return;
     g_state = s;
+    if (s != LCD_STATE_THINKING) g_think_elapsed = -1;
     render_state(s);
     esp_err_t err = draw_fb_banded();
     if (err != ESP_OK) {
