@@ -236,6 +236,32 @@ void handle_req(cJSON *root) {
         }
         if (err == ESP_OK) send_res_ok(rpc_id, nullptr);
         else               send_res_err(rpc_id, "led_failed", esp_err_to_name(err));
+    } else if (strcmp(method, "set_led_effect") == 0 ||
+               strcmp(method, "led_effect") == 0) {
+        // Animated LED effect. params {name, r?, g?, b?, speed_ms?}.
+        // name ∈ {off, solid, rainbow, breathing, pulse, scanner, wipe,
+        //         sparkle, police, fire, chase, theater, listening,
+        //         thinking, talking, recording}.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *n_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "name") : nullptr;
+        if (!cJSON_IsString(n_j)) {
+            send_res_err(rpc_id, "bad_params", "missing name");
+            return;
+        }
+        const cJSON *r_j = cJSON_GetObjectItemCaseSensitive(p_j, "r");
+        const cJSON *g_j = cJSON_GetObjectItemCaseSensitive(p_j, "g");
+        const cJSON *b_j = cJSON_GetObjectItemCaseSensitive(p_j, "b");
+        const cJSON *s_j = cJSON_GetObjectItemCaseSensitive(p_j, "speed_ms");
+        uint8_t r = cJSON_IsNumber(r_j) ? (uint8_t)r_j->valueint : 0;
+        uint8_t g = cJSON_IsNumber(g_j) ? (uint8_t)g_j->valueint : 0;
+        uint8_t b = cJSON_IsNumber(b_j) ? (uint8_t)b_j->valueint : 0;
+        uint16_t speed = cJSON_IsNumber(s_j) ? (uint16_t)s_j->valueint : 0;
+        esp_err_t err = led_set_effect(n_j->valuestring, r, g, b, speed);
+        if (err == ESP_OK) send_res_ok(rpc_id, nullptr);
+        else if (err == ESP_ERR_NOT_FOUND)
+            send_res_err(rpc_id, "unknown_effect", n_j->valuestring);
+        else
+            send_res_err(rpc_id, "effect_failed", esp_err_to_name(err));
     } else if (strcmp(method, "move") == 0 ||
                strcmp(method, "head") == 0 ||
                strcmp(method, "head_normalized") == 0) {

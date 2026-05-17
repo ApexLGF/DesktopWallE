@@ -30,6 +30,21 @@ esp_err_t led_set_all(uint8_t r, uint8_t g, uint8_t b);
 // dark on the wire and uart writes have no effect.
 esp_err_t led_set_servo_power(bool enable);
 
+// Animated LED effects — port of the old Arduino firmware's
+// `setLedEffect` taxonomy. An internal task drives the animation at
+// ~30 Hz; calling this just updates the desired effect / colour /
+// speed. Returns ESP_ERR_NOT_FOUND for unknown names.
+//
+// Effect names (16):
+//   off, solid, rainbow, breathing, pulse, scanner, wipe, sparkle,
+//   police, fire, chase, theater, listening, thinking, talking,
+//   recording
+//
+// `r, g, b`     base colour (effects that don't use it ignore them).
+// `speed_ms`    ms per frame tick; 0 lets the effect choose its own.
+esp_err_t led_set_effect(const char *name, uint8_t r, uint8_t g, uint8_t b,
+                         uint16_t speed_ms);
+
 #ifdef __cplusplus
 }
 #endif
