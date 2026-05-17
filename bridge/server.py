@@ -889,11 +889,16 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                 await hub.rpc(device, "show_text",
                               {"title": "回复", "text": reply}, timeout=2.0)
             _appid, _token = doubao_tts._load_creds()
+            _tts_cfg = bridge_config.get_tts()
+            _speaker = _tts_cfg.speaker or doubao_tts_unidirectional.DEFAULT_SPEAKER
             tts_iter = doubao_tts_unidirectional.synthesize_stream(
                 reply,
                 app_key=_appid, access_key=_token,
+                speaker=_speaker,
                 sample_rate=16000,
                 audio_format="pcm",
+                speech_rate=_tts_cfg.speech_rate,
+                loudness_rate=_tts_cfg.loudness_rate,
                 uid=device.device_id,
             )
             try:
@@ -1317,13 +1322,17 @@ async def http_say(req: web.Request) -> web.Response:
                                   "mode": "legacy",
                                   "est_ms": (len(pcm) // 2) * 1000 // sr})
     appid, token = doubao_tts._load_creds()
-    speaker = body.get("speaker") or doubao_tts_unidirectional.DEFAULT_SPEAKER
+    tts_cfg = bridge_config.get_tts()
+    speaker = (body.get("speaker") or tts_cfg.speaker
+               or doubao_tts_unidirectional.DEFAULT_SPEAKER)
     tts_iter = doubao_tts_unidirectional.synthesize_stream(
         text,
         app_key=appid, access_key=token,
         speaker=speaker,
         sample_rate=sr,
         audio_format="pcm",
+        speech_rate=tts_cfg.speech_rate,
+        loudness_rate=tts_cfg.loudness_rate,
         uid=device.device_id,
     )
     try:
@@ -1744,9 +1753,10 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    log.info("config: doubao=ok ws=%s:%d http=%s:%d source=%s",
+    _effective_speaker = cfg.tts.speaker or doubao_tts_unidirectional.DEFAULT_SPEAKER
+    log.info("config: doubao=ok ws=%s:%d http=%s:%d tts.speaker=%s source=%s",
              args.ws_host, args.ws_port, args.http_host, args.http_port,
-             cfg.source)
+             _effective_speaker, cfg.source)
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:

@@ -74,12 +74,24 @@ class AgentSettings:
 
 
 @dataclass(frozen=True)
+class TtsSettings:
+    """Default TTS knobs. Each /say call can still override these per-request."""
+    # Empty string → fall back to doubao_tts_unidirectional.DEFAULT_SPEAKER.
+    speaker:       str = ""
+    sample_rate:   int = 16000
+    audio_format:  str = "pcm"
+    speech_rate:   int = 0     # [-50, 100]  -50=½×  0=normal  100=2×
+    loudness_rate: int = 0     # [-50, 100]
+
+
+@dataclass(frozen=True)
 class Config:
     doubao: DoubaoCreds
     ws:     WsSettings    = field(default_factory=WsSettings)
     http:   HttpSettings  = field(default_factory=HttpSettings)
     mcp:    McpSettings   = field(default_factory=McpSettings)
     agent:  AgentSettings = field(default_factory=AgentSettings)
+    tts:    TtsSettings   = field(default_factory=TtsSettings)
     source: Path | None   = None     # where the toml came from, for logging
 
 
@@ -104,6 +116,7 @@ def _build(data: dict, source: Path) -> Config:
     http = data.get("http") or {}
     mcp  = data.get("mcp") or {}
     ag   = data.get("agent") or {}
+    tts  = data.get("tts") or {}
     return Config(
         doubao = DoubaoCreds(
             appid        = appid,
@@ -122,6 +135,13 @@ def _build(data: dict, source: Path) -> Config:
         agent = AgentSettings(
             hermes_url   = (ag.get("hermes_url") or "").strip(),
             openclaw_url = (ag.get("openclaw_url") or "").strip(),
+        ),
+        tts = TtsSettings(
+            speaker       = (tts.get("speaker") or "").strip(),
+            sample_rate   = int(tts.get("sample_rate",   16000)),
+            audio_format  = (tts.get("audio_format") or "pcm").strip(),
+            speech_rate   = int(tts.get("speech_rate",   0)),
+            loudness_rate = int(tts.get("loudness_rate", 0)),
         ),
         source = source,
     )
@@ -174,6 +194,10 @@ def get_mcp() -> McpSettings:
 
 def get_agent() -> AgentSettings:
     return load().agent
+
+
+def get_tts() -> TtsSettings:
+    return load().tts
 
 
 if __name__ == "__main__":
