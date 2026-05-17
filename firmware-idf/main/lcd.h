@@ -34,6 +34,14 @@ void      lcd_set_state(lcd_state_t s);
 // no-op so we don't accidentally repaint over a fresher transition.
 void      lcd_set_think_elapsed(int seconds);
 
+// Schedule a flip to LCD_STATE_IDLE after `delay_ms`. Any subsequent
+// `lcd_set_state` call cancels the pending flip, so this is safe to fire
+// proactively — if the bridge moves us into a real state (LISTENING /
+// THINKING / SPEAKING) before the timer expires, the IDLE never lands.
+// Used to return the screen to a polite "ready for next turn" indicator
+// after TTS playback drains.
+void      lcd_arm_idle_in(uint32_t delay_ms);
+
 #ifdef __cplusplus
 }
 #endif

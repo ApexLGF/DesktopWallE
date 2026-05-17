@@ -41,6 +41,7 @@ esp_lcd_panel_io_handle_t g_io        = nullptr;
 SemaphoreHandle_t         g_trans_sem = nullptr;  // released by on_color_trans_done
 uint16_t                 *g_fb        = nullptr;     // PSRAM framebuffer, RGB565 BE
 lcd_state_t               g_state     = LCD_STATE_BOOT;
+esp_timer_handle_t        g_idle_timer = nullptr;   // optional deferred IDLE flip
 
 // Called from ISR when esp_lcd has finished pushing the last byte of a
 // queued draw_bitmap. Lets us block the next paint until the bus is idle
@@ -290,6 +291,11 @@ void lcd_set_think_elapsed(int seconds) {
 
 void lcd_set_state(lcd_state_t s) {
     if (!g_panel) return;
+    // Any explicit state change supersedes a pending auto-IDLE — without
+    // this guard the timer fires later and overwrites a fresh LISTEN/THINK.
+    if (g_idle_timer && s != LCD_STATE_IDLE) {
+        esp_timer_stop(g_idle_timer);
+    }
     if (s == g_state) return;
     g_state = s;
     if (s != LCD_STATE_THINKING) g_think_elapsed = -1;
@@ -299,4 +305,29 @@ void lcd_set_state(lcd_state_t s) {
         ESP_LOGW(TAG, "state %d banded paint: %s", (int)s, esp_err_to_name(err));
     }
     ESP_LOGI(TAG, "state → %d", (int)s);
+}
+
+namespace {
+void idle_timer_cb(void *) {
+    // Don't barge in if something raised the screen state in the
+    // meantime — e.g., the next mic.start already came in.
+    if (g_state == LCD_STATE_SPEAKING || g_state == LCD_STATE_HEARD) {
+        lcd_set_state(LCD_STATE_IDLE);
+    }
+}
+}  // namespace
+
+void lcd_arm_idle_in(uint32_t delay_ms) {
+    if (!g_panel) return;
+    if (!g_idle_timer) {
+        esp_timer_create_args_t args = {};
+        args.callback = idle_timer_cb;
+        args.name     = "lcd_idle";
+        if (esp_timer_create(&args, &g_idle_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "esp_timer_create(lcd_idle) failed");
+            return;
+        }
+    }
+    esp_timer_stop(g_idle_timer);  // restart if already pending
+    esp_timer_start_once(g_idle_timer, (uint64_t)delay_ms * 1000);
 }

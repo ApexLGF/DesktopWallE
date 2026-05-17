@@ -230,8 +230,6 @@ extern "C" void app_main(void) {
     int64_t     t0_us         = esp_timer_get_time();
     int         frames        = 0;
     int         heartbeat_period = 1000 / (frame_samps * 1000 / model_sr);   // ≈31 frames
-    bool        prev_streaming = false;
-    int         idle_paint_at  = -1;     // when (in frames) to flip LCD back to IDLE
 
     while (true) {
         int got = mic_read_multi(multi, frame_samps);
@@ -280,17 +278,12 @@ extern "C" void app_main(void) {
             }
             prev = cur;
         }
-        // Schedule LCD → IDLE shortly after the mic stream closes so the
-        // user gets a clear "we're done, talk again to wake" cue.
-        bool streaming_now = bridge_ws_mic_streaming();
-        if (prev_streaming && !streaming_now) {
-            idle_paint_at = frames + heartbeat_period * 3;   // ~3 s later
-        }
-        prev_streaming = streaming_now;
-        if (idle_paint_at > 0 && frames >= idle_paint_at) {
-            if (bridge_ws_is_connected()) lcd_set_state(LCD_STATE_IDLE);
-            idle_paint_at = -1;
-        }
+        // LCD → IDLE used to fire here on mic-stream end, but that races
+        // the bridge — Hermes can take 80 s to think and bridge wouldn't
+        // send "思考中" until partway through. The IDLE flicker between
+        // HEARD and THINK was misleading. Now lcd_arm_idle_in() is called
+        // from speaker.cpp once TTS playback actually drains, which is
+        // the only "we're truly done" signal the device has.
 
         if ((frames % heartbeat_period) == 0) {
             ESP_LOGI(TAG, "[hb] t=%6lld ms frames=%d  ws=%d streaming=%d  state=%s",

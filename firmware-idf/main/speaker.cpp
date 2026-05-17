@@ -32,6 +32,7 @@
 
 #include "mic.h"
 #include "bridge_ws.h"
+#include "lcd.h"
 
 static const char *TAG = "spk";
 
@@ -208,6 +209,9 @@ void speaker_task(void *arg) {
             close_after_playback();
             g_active = false;
             bridge_ws_send_tts_done(c.sid);
+            // Give the bridge a beat to start the next turn (mic_start
+            // will cancel this), then settle the LCD back to IDLE.
+            lcd_arm_idle_in(2000);
             continue;
         }
         if (!c.pcm) continue;
