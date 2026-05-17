@@ -30,8 +30,9 @@ from aiohttp import web
 from protocol import (
     decode_text, decode_binary, encode_binary, frame_req, frame_err, frame_pong,
     frame_hello_ack, frame_tts_start, frame_tts_end,
-    KIND_MIC_PCM, KIND_TTS_PCM, KIND_CAM_JPEG, KIND_DISP_IMG, KIND_DISP_RGB565,
+    KIND_MIC_PCM, KIND_TTS_PCM, KIND_TTS_OPUS, KIND_CAM_JPEG, KIND_DISP_IMG, KIND_DISP_RGB565,
 )
+import opuslib
 import struct
 import aiohttp
 import config as bridge_config
@@ -70,18 +71,18 @@ async def sensevoice_transcribe(pcm16le: bytes,
     form = aiohttp.FormData()
     form.add_field("file", wav, filename="utt.wav",
                    content_type="audio/wav")
+    # NOTE: this function lets exceptions PROPAGATE so the caller in
+    # _capture_utterance can distinguish "service unavailable" from
+    # "valid empty transcript". Connection / timeout / non-200 all
+    # raise; only empty string means "server heard nothing".
     async with aiohttp.ClientSession() as s:
-        try:
-            async with s.post(SENSEVOICE_URL, data=form,
-                                timeout=aiohttp.ClientTimeout(total=20)) as r:
-                data = await r.json()
-                if not r.ok:
-                    log.warning("[asr] sensevoice %d: %s", r.status, data)
-                    return ""
-                return (data.get("text") or "").strip()
-        except Exception:
-            log.exception("[asr] sensevoice POST failed")
-            return ""
+        async with s.post(SENSEVOICE_URL, data=form,
+                            timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if not r.ok:
+                body = await r.text()
+                raise RuntimeError(f"sensevoice http={r.status}: {body[:200]}")
+            data = await r.json()
+            return (data.get("text") or "").strip()
 
 
 # ----- Doubao oneshot ASR (Seed-ASR 2.0 streaming, fed as one shot) -----
@@ -223,6 +224,12 @@ class Device:
     # to Doubao — see ASR_FRAME_BYTES note in handle_binary.
     asr_outbuf: bytearray = field(default_factory=bytearray)
     tts_active: bool = False                          # speaker is actually playing or has queued PCM
+    # Set by http_say when a /say call lands during a voice_loop turn.
+    # voice_loop resets it at the start of every turn and checks it
+    # before auto-TTSing the Hermes stdout — if a hotdog skill already
+    # spoke via `sc say`, the bridge MUST NOT speak the stdout again
+    # (double-speak: same content played twice on the device).
+    say_invoked_this_turn: bool = False
 
     def next_sid(self) -> int:
         sid = self.sid_seq
@@ -251,9 +258,43 @@ class Hub:
 
     async def unregister(self, device: Device) -> None:
         async with self._lock:
-            if self.devices.get(device.device_id) is device:
+            popped = self.devices.get(device.device_id) is device
+            if popped:
                 self.devices.pop(device.device_id, None)
                 log.info("[hub] unregistered %s", device.device_id)
+        # Cancel everything attached to the dead Device, whether or not
+        # we were still the registered handle. Without this, a crashed
+        # device's old voice_loop keeps running 10+ s, calls Doubao TTS
+        # for a reply nobody can hear, and races with the new connection's
+        # voice_loop on the reconnect.
+        for attr in ("voice_task", "stream_task", "tracker"):
+            t = getattr(device, attr, None)
+            if t is not None and not t.done():
+                t.cancel()
+                log.info("[hub] cancelled %s on %s", attr, device.device_id)
+        # Mark in-flight RPC futures as failed so any await on them
+        # raises immediately instead of hanging until the 2 s timeout.
+        for rpc_id, fut in list(device.pending.items()):
+            if not fut.done():
+                fut.set_exception(
+                    websockets.ConnectionClosed(rcvd=None, sent=None))
+        device.pending.clear()
+        # Best-effort: close the active Doubao ASR session if any.
+        asr = getattr(device, "asr", None)
+        if asr is not None:
+            close = getattr(asr, "close", None)
+            if callable(close):
+                try:
+                    res = close()
+                    if asyncio.iscoroutine(res):
+                        asyncio.create_task(res)
+                except Exception:
+                    pass
+            device.asr = None
+        # Flush the mic dump so any late voice_loop iteration that still
+        # references this Device sees no audio and bails fast.
+        device.mic_dump = None
+        device.mic_end_evt.set()  # unblock any awaiter
 
     def get(self, device_id: str | None) -> Device | None:
         if not self.devices:
@@ -365,17 +406,30 @@ async def handle_text(hub: Hub, device: Device, raw: str) -> None:
             # idle for real and a wake here is a genuine new turn.
             already_busy = (device.voice_task is not None
                             and not device.voice_task.done())
-            if already_busy and device.tts_active:
-                log.info("[voice] WAKE interrupts active TTS")
+            # `tap` = physical button press on the head; always an
+            # intentional interrupt. WakeNet (`hi_walle` etc.) is a
+            # neural detector that can false-fire on echo, so we
+            # only treat it as an interrupt while TTS is playing.
+            is_explicit = (word == "tap")
+            if already_busy and (device.tts_active or is_explicit):
+                reason = ("WAKE(tap) interrupts current turn"
+                          if is_explicit else
+                          "WAKE interrupts active TTS")
+                log.info("[voice] %s", reason)
                 if device.stream_task and not device.stream_task.done():
                     device.stream_task.cancel()
                 device.voice_task.cancel()
-                asyncio.create_task(_safe_tts_stop(hub, device))
+                if device.tts_active:
+                    asyncio.create_task(_safe_tts_stop(hub, device))
+                device.voice_task = asyncio.create_task(voice_loop(hub, device))
             elif already_busy:
-                # Loop is running but no audio playing — likely capture/
-                # think phase. Cancel and restart so the user can re-prompt.
-                device.voice_task.cancel()
-            device.voice_task = asyncio.create_task(voice_loop(hub, device))
+                # WakeNet during capture / ASR / Hermes — almost always
+                # a false positive from room echo. Cancelling here
+                # would abort Hermes; ignore instead.
+                log.info("[voice] WAKE(%s) ignored — voice_loop in capture/think phase", word)
+            else:
+                # Truly idle — start a fresh turn.
+                device.voice_task = asyncio.create_task(voice_loop(hub, device))
         elif name == "tts.done":
             device.tts_active = False
             device.tts_done_evt.set()
@@ -591,7 +645,12 @@ async def _stream_pcm_async_locked(device: Device,
     device.tts_active = True
     # est_ms unknown until producer finishes; device tolerates est_ms=0
     # (it's only used for the UI progress hint).
-    await device.ws.send(frame_tts_start(sid=sid, sr=sample_rate, est_ms=0))
+    # Switched from raw PCM to OPUS to absorb WiFi delivery jitter on
+    # the device side (60 ms PCM = 1920 B, opus = ~30-60 B → 30x smaller).
+    # Encoder is recreated per stream so any prior tts.stop leaves no
+    # stale internal state.
+    opus_enc = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
+    await device.ws.send(frame_tts_start(sid=sid, sr=sample_rate, est_ms=0, fmt="opus"))
 
     CHUNK = 1920                                 # 60 ms @ 16k mono int16
     chunk_s = CHUNK / 2 / sample_rate
@@ -655,7 +714,12 @@ async def _stream_pcm_async_locked(device: Device,
                 now = loop.time()
                 if target > now:
                     await asyncio.sleep(target - now)
-            await device.ws.send(encode_binary(KIND_TTS_PCM, sid, seq, chunk_bytes))
+            # Pad short tail chunk to exactly CHUNK bytes so the encoder
+            # always sees a full 60 ms frame (opus is fixed-frame).
+            if len(chunk_bytes) < CHUNK:
+                chunk_bytes = chunk_bytes + b"\x00" * (CHUNK - len(chunk_bytes))
+            opus_pkt = opus_enc.encode(chunk_bytes, CHUNK // 2)
+            await device.ws.send(encode_binary(KIND_TTS_OPUS, sid, seq, opus_pkt))
             seq += 1
             sent += len(chunk_bytes)
     finally:
@@ -749,7 +813,7 @@ async def _push_idle_face(device: Device) -> None:
 VOICE_MAX_RECORD_S = 15.0      # hard ceiling
 VOICE_SILENCE_S    = 1.8       # seconds without new partial → finalize
 ASR_END_WINDOW_MS  = 2000      # Doubao's own server-side detector (we mostly ignore its result)
-HERMES_TIMEOUT_S   = 35.0
+HERMES_TIMEOUT_S   = 90.0
 HERMES_SKILLS      = "hotdog"
 # Per-device dialog history cap fed back to Doubao as `context`. Volcengine
 # limit is ~800 tokens / 20 turns; 24 entries (≈12 round trips) is well inside
@@ -786,6 +850,8 @@ async def voice_loop(hub: Hub, device: Device) -> None:
         had_success = False # any successful turn → silence on next turn = exit
         while True:
             turn += 1
+            # Reset double-speak guard — every turn starts fresh.
+            device.say_invoked_this_turn = False
             is_followup = had_success     # follow-up only after a real reply
             is_retry = asr_strikes > 0    # we're re-listening after empty ASR
             max_record = 5.0 if is_followup else VOICE_MAX_RECORD_S
@@ -824,22 +890,24 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                     log.info("[voice] %s follow-up timed out, ending loop",
                              device.device_id)
                     break
-                # Otherwise this is a recognition failure — count a strike
-                # and re-listen up to ASR_RETRY_LIMIT times. The screen
-                # already shows "识别失败 / 请再说一次" from _capture_utterance.
-                asr_strikes += 1
-                log.info("[voice] %s asr strike %d/%d",
-                         device.device_id, asr_strikes, ASR_RETRY_LIMIT)
-                if asr_strikes < ASR_RETRY_LIMIT:
-                    await asyncio.sleep(0.6)   # let user read the prompt
-                    continue
-                # Exhausted retries → sad face and bail.
-                log.info("[voice] %s asr exhausted, ending loop",
+                # Empty transcript can mean either (a) user didn't
+                # speak, and we already short-circuited Doubao via the
+                # first_voice_at == 0 path, or (b) Doubao timed out /
+                # returned no valid speech. In both cases re-opening
+                # LISTEN to "try again" conflates two different
+                # failure modes; per user feedback the right thing
+                # is to end the loop and let the user re-wake when
+                # they're ready. Show ASR ERR for ~1.5 s so they see
+                # what happened, then drop back to IDLE.
+                log.info("[voice] %s asr empty — ending loop, back to IDLE",
                          device.device_id)
-                asyncio.create_task(_set_led(hub, device, *LED_ERROR))
                 with contextlib.suppress(Exception):
-                    await _ship_jpeg(device, screen.face_jpeg("sad"))
-                await asyncio.sleep(0.8)
+                    await hub.rpc(device, "show_text",
+                                  {"title": "识别失败",
+                                   "text": "请按额头或说 Hi WallE 重试"},
+                                  timeout=1.5)
+                asyncio.create_task(_set_led(hub, device, *LED_ERROR))
+                await asyncio.sleep(1.5)
                 return
             # success: reset strike counter and remember we got a real turn
             asr_strikes = 0
@@ -884,6 +952,10 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(ticker_task, timeout=1.0)
             reply = (reply or "").strip() or "嗯,我现在不太能回答这个。"
+            # Hermes ignores the SKILL.md "no markdown" rule, so we
+            # sanitise server-side before TTS / show_text. Without
+            # this Doubao TTS literally reads asterisks.
+            reply = _strip_markdown_for_tts(reply)
             log.info("[voice] %s reply: %s", device.device_id, reply[:160])
             # Record bot turn so the next ASR session sees the full Q&A.
             device.dialog_history.insert(0, f"助手: {reply}")
@@ -899,6 +971,15 @@ async def voice_loop(hub: Hub, device: Device) -> None:
             # it arrives instead of waiting for the entire reply to
             # render (~1.5 s for a 5 s utterance). That ~1 s saving is
             # the entire reason we picked the chunked endpoint.
+            #
+            # Double-speak guard: if a hotdog skill already called
+            # /say during this turn (e.g. `sc say "今天天气..."`),
+            # Hermes' stdout is the same content piped back. TTSing it
+            # again means the user hears it twice. Skip in that case.
+            if device.say_invoked_this_turn:
+                log.info("[voice] %s skip auto-TTS — /say already invoked this turn",
+                         device.device_id)
+                continue
             with contextlib.suppress(Exception):
                 await hub.rpc(device, "show_text",
                               {"title": "回复", "text": reply}, timeout=2.0)
@@ -934,13 +1015,20 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                 with contextlib.suppress(Exception):
                     await tts_iter.aclose()
 
-            # stream_pcm already blocked until t0 + audio_duration + 0.4s
-            # margin, so the speaker has truly drained by now. We no longer
-            # wait on the device's `tts.done` event — it lags 1-10 s
-            # inconsistently and used to make us either (a) cut off audio
-            # by opening mic too early or (b) hang the loop for 20 s. The
-            # event is still fired by the device and observed by the wake
-            # handler, just not gating voice_loop anymore.
+            # stream_pcm's pacing margin (0.4 s) underestimates the
+            # device-side queue: opus decode + speaker DMA buffer +
+            # network jitter add up to ~1.5 s of audio still playing
+            # AFTER we've finished sending. Without waiting here we'd
+            # open the next mic while the tail is still on the speaker,
+            # and SenseVoice would ASR the bot's own voice back as the
+            # user turn. Wait for the device's explicit tts.done event,
+            # capped at 2 s so a malfunctioning device can't hang the
+            # loop forever.
+            try:
+                await asyncio.wait_for(device.tts_done_evt.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                log.warning("[voice] %s tts.done not received in 2 s — opening mic anyway",
+                            device.device_id)
             device.tts_active = False
 
             # Loop back: open mic again for an automatic follow-up turn.
@@ -1055,15 +1143,30 @@ async def _capture_utterance(hub: Hub, device: Device,
                             first_voice_at = now
                             log.info("[voice] speech start +%.2fs", elapsed)
 
-            if first_voice_at:
-                # Speech began — wait for sustained silence.
-                if (now - last_voice_at) >= PARTIAL_QUIET_S \
-                        and elapsed >= MIN_RECORD_S:
-                    log.info("[voice] quiet %.2fs after speech → stop",
-                             now - last_voice_at)
-                    break
-            else:
-                # No speech yet — warn at 2 s, give up at PRE_SPEECH_TIMEOUT_S.
+            # Two end-of-speech triggers race:
+            #   1) device VADNet mic.end (handled above) — usually
+            #      fastest when the VAD model wakes up in time;
+            #   2) bridge-side RMS quiet: 3 s of audio below the
+            #      energy threshold AFTER the user has spoken.
+            # The bridge fallback is here because the device's
+            # neural VADNet has been measured lagging the real
+            # end-of-utterance by 4-6 s on this hardware (75 dB mic
+            # gain inflates background noise into "speech" frames).
+            # 3 s is generous enough to cover natural mid-sentence
+            # pauses but short enough that the user doesn't wait
+            # the full 15 s max_record_s.
+            QUIET_FALLBACK_S = 3.0
+            if first_voice_at \
+                    and (now - last_voice_at) >= QUIET_FALLBACK_S \
+                    and elapsed >= MIN_RECORD_S:
+                log.info("[voice] bridge RMS quiet %.1fs after speech → stop",
+                         now - last_voice_at)
+                break
+            if not first_voice_at:
+                # No RMS voice at all — warn at 2 s, give up at
+                # PRE_SPEECH_TIMEOUT_S. (When device VAD already fired
+                # mic.end, the branch above broke out; we only reach
+                # here for true silence captures.)
                 if elapsed > 2.0 and not quiet_warned:
                     quiet_warned = True
                     with contextlib.suppress(Exception):
@@ -1089,30 +1192,145 @@ async def _capture_utterance(hub: Hub, device: Device,
                           {"title": "没听清",
                            "text": "请再说一次"}, timeout=2.0)
         return ""
+    # Local RMS detector never saw voice — no point spending ¥ asking
+    # Doubao to transcribe silence. Treat as empty result; voice_loop
+    # will route into its no-speech path (follow-up timeout / strike).
+    if first_voice_at == 0.0:
+        log.info("[voice] no voice in %d bytes (%.1f s) — skipping ASR call",
+                 pcm_len, pcm_len / 32000)
+        with contextlib.suppress(Exception):
+            await hub.rpc(device, "show_text",
+                          {"title": "没听到",
+                           "text": "请讲，我在听…"}, timeout=2.0)
+        return ""
 
-    # --- 3. Flash ASR.
+    # --- 3. Flash ASR with elapsed-seconds ticker.
     log.info("[voice] capture %d bytes (%.1f s) → flash asr",
              pcm_len, pcm_len / 32000)
     with contextlib.suppress(Exception):
         await hub.rpc(device, "show_text",
                       {"title": "识别中…",
                        "text": f"{pcm_len//32000} 秒语音"}, timeout=1.5)
+
+    # The Doubao Flash call can take 3-10 s on a slow link or up to
+    # the full timeout on errors. Without a ticker the device LCD
+    # would tick down its 15 s auto-IDLE timer and the screen would
+    # drop back to IDLE while the bridge is still waiting. We push a
+    # `识别中… Ns秒` show_text every 1 s; LCD's `识别` prefix maps to
+    # the ASR state so it just renders the elapsed counter under
+    # the ASR label.
+    asr_done = asyncio.Event()
+    asr_t0 = time.time()
+    async def asr_ticker() -> None:
+        while not asr_done.is_set():
+            try:
+                await asyncio.wait_for(asr_done.wait(), timeout=1.0)
+                return
+            except asyncio.TimeoutError:
+                pass
+            elapsed = int(time.time() - asr_t0) + 1
+            with contextlib.suppress(Exception):
+                await hub.rpc(device, "show_text",
+                              {"title": f"识别中… {elapsed}秒",
+                               "text": f"{pcm_len//32000} 秒语音"}, timeout=1.0)
+    ticker_task = asyncio.create_task(asr_ticker())
+    transcript = ""
+    sv_used = False     # did SenseVoice produce the transcript?
     try:
-        result = await doubao_asr_flash.transcribe(
-            pcm, app_key=appid, access_key=token,
-            sample_rate=16000,
-            enable_punc=True, enable_itn=True, enable_ddc=True,
-        )
-        transcript = result.text.strip()
-        log.info("[voice] flash asr -> %r (%dms audio, %d utts)",
-                 transcript, result.duration_ms, len(result.utterances))
-    except doubao_asr_flash.FlashError as e:
-        log.warning("[voice] flash asr error: %s", e)
-        transcript = ""
-    except Exception:
-        log.exception("[voice] flash asr exception")
-        transcript = ""
+        # 1) Try local SenseVoice first. Faster + works when Doubao
+        #    is flaky (especially at night). Empty string means SV
+        #    heard nothing → trust it, skip Doubao. Exception means
+        #    SV unreachable / timed out → fall through to Doubao.
+        try:
+            sv_t0 = time.time()
+            sv_text = await sensevoice_transcribe(pcm, sample_rate=16000)
+            transcript = sv_text
+            sv_used = True
+            log.info("[voice] sensevoice -> %r (%dms)",
+                     transcript, int((time.time() - sv_t0) * 1000))
+        except Exception as e:
+            log.warning("[voice] sensevoice unavailable (%s: %s) — falling back to Doubao",
+                        type(e).__name__, e)
+
+        # 2) Doubao fallback if SenseVoice didn't run successfully.
+        if not sv_used:
+            try:
+                result = await doubao_asr_flash.transcribe(
+                    pcm, app_key=appid, access_key=token,
+                    sample_rate=16000,
+                    enable_punc=True, enable_itn=True, enable_ddc=True,
+                )
+                transcript = result.text.strip()
+                log.info("[voice] doubao flash asr -> %r (%dms audio, %d utts)",
+                         transcript, result.duration_ms, len(result.utterances))
+            except doubao_asr_flash.FlashError as e:
+                log.warning("[voice] flash asr error: %s", e)
+                transcript = ""
+            except Exception as e:
+                log.warning("[voice] flash asr unexpected: %s: %s",
+                            type(e).__name__, e)
+                transcript = ""
+    finally:
+        asr_done.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(ticker_task, timeout=0.5)
     return transcript
+
+
+_MD_PATTERNS = [
+    (re_compile := __import__("re").compile)(r"```[\s\S]*?```"),   # fenced code blocks
+    re_compile(r"`([^`]+)`"),                                              # inline code
+    re_compile(r"\*\*([^*\n]+)\*\*"),                                # **bold**
+    re_compile(r"__([^_\n]+)__"),                                          # __bold__
+    re_compile(r"\*([^*\n]+)\*"),                                       # *italic*
+    re_compile(r"~~([^~\n]+)~~"),                                          # ~~strike~~
+    re_compile(r"!\[([^\]]*)\]\([^)]+\)"),                            # ![alt](url) → alt
+    re_compile(r"\[([^\]]+)\]\([^)]+\)"),                              # [text](url) → text
+]
+_MD_LINE_PATTERNS = [
+    re_compile(r"^#{1,6}\s+"),       # # heading → ''
+    re_compile(r"^>\s+"),             # > quote → ''
+    re_compile(r"^\s*[-*+]\s+"),     # - bullet → ''
+    re_compile(r"^\s*\d+\.\s+"),   # 1. numbered → ''
+    re_compile(r"^---+\s*$"),         # --- hr → ''
+]
+import re as _re_mod
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """Strip markdown syntax so Doubao TTS doesn't read 'asterisk
+    asterisk bold asterisk asterisk' out loud. Conservative: handles
+    the patterns Hermes actually emits (bold, lists, code, links)
+    without touching domain text like '17°C ~ 26°C' (single tilde
+    survives the ~~strike~~ pattern).
+    """
+    if not text:
+        return text
+    out = text
+    # Pass 1: inline patterns where we keep the captured content.
+    for pat in _MD_PATTERNS:
+        # `\1` works because each pattern has at most one group; the
+        # fenced-code one has none, so use no-replacement.
+        if pat.groups:
+            out = pat.sub(r"\1", out)
+        else:
+            out = pat.sub("", out)
+    # Pass 2: line-anchored markers — strip at line starts.
+    new_lines = []
+    for line in out.split("\n"):
+        s = line
+        for pat in _MD_LINE_PATTERNS:
+            s = pat.sub("", s)
+        new_lines.append(s)
+    out = "\n".join(new_lines)
+    # Collapse repeated blank lines.
+    out = _re_mod.sub(r"\n\s*\n+", "\n", out)
+    # Newline after a colon → drop the newline; the colon already cues a pause.
+    out = _re_mod.sub(r"\uff1a\s*\n+", "\uff1a", out)  # 中文冒号 ：
+    out = _re_mod.sub(r":\s*\n+", ":", out)            # ASCII colon
+    # Other newlines → 中文逗号 (TTS-friendly pause).
+    out = _re_mod.sub(r"\n+", "\uff0c", out)
+    # Trim leading/trailing whitespace and stray commas.
+    return out.strip().strip("\uff0c,")
 
 
 async def _ask_hermes(text: str) -> str:
@@ -1328,6 +1546,10 @@ async def http_say(req: web.Request) -> web.Response:
     device = hub.get(body.get("device"))
     if device is None:
         return web.json_response({"ok": False, "error": "no device"}, status=404)
+    # Mark that the bridge is speaking on behalf of a higher-level
+    # caller this turn — voice_loop will skip its own auto-TTS of
+    # Hermes stdout to avoid double-speak.
+    device.say_invoked_this_turn = True
     sr = int(body.get("sample_rate", 16000))
     if body.get("legacy"):
         try:

@@ -20,6 +20,7 @@ PROTOCOL_VERSION = 0x02
 # binary frame "kind" bytes
 KIND_MIC_PCM = 0x01    # device -> bridge : PCM16LE 16k mono mic
 KIND_TTS_PCM = 0x02    # bridge -> device : PCM16LE 16k mono speaker
+KIND_TTS_OPUS = 0x06   # bridge -> device : opus packet (16k mono, 60 ms frame)
 KIND_CAM_JPEG = 0x03   # device -> bridge : JPEG capture result
 KIND_DISP_IMG = 0x04   # bridge -> device : JPEG to show full-screen
 KIND_DISP_RGB565 = 0x05  # bridge -> device : raw RGB565 LE 320x240 = 153600 B
@@ -99,9 +100,9 @@ def frame_mic_end(sid: int, reason: str = "") -> str:
     return encode_text({"t": "mic.end", "sid": sid, "reason": reason})
 
 
-def frame_tts_start(sid: int, sr: int = 16000, est_ms: int = 0) -> str:
+def frame_tts_start(sid: int, sr: int = 16000, est_ms: int = 0, fmt: str = "pcm16") -> str:
     return encode_text({"t": "tts.start", "sid": sid, "sr": sr,
-                        "fmt": "pcm16", "est_ms": est_ms})
+                        "fmt": fmt, "est_ms": est_ms})
 
 
 def frame_tts_end(sid: int) -> str:

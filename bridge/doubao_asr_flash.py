@@ -155,8 +155,8 @@ async def transcribe(
     enable_ddc: bool = True,
     audio_format: str = "ogg_opus",   # "ogg_opus" (default, fast upload) | "wav"
     opus_bitrate_kbps: int = 16,
-    timeout_s: float = 30.0,
-    max_retries: int = 2,
+    timeout_s: float = 8.0,
+    max_retries: int = 1,
     http_client: httpx.AsyncClient | None = None,
 ) -> FlashResult:
     """One-shot ASR. Blocks until the server returns the full transcript.
