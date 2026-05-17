@@ -1,0 +1,33 @@
+name: hotdog-platform
+label: Hotdog (热狗)
+kind: platform
+version: 0.1.0
+description: >
+  Voice channel for the M5StackChan 热狗 desk robot.
+
+  The bridge daemon (127.0.0.1:8766) owns the device WebSocket plus ASR/TTS;
+  this plugin wires those into Hermes' gateway. Wake-word + final ASR
+  transcripts arrive here as MessageEvents via a local HTTP listener; agent
+  text replies leave through `bridge /say` (Doubao TTS → device speaker).
+
+  Each physical device becomes its own chat_id, so sessions, mem0 memory
+  and multi-turn context are kept by the gateway just like any other
+  messenger platform (Telegram / Feishu / Slack / …).
+author: Hotdog
+optional_env:
+  - name: HOTDOG_BRIDGE_URL
+    description: "Bridge daemon HTTP URL (default http://127.0.0.1:8766)"
+    prompt: "Bridge URL"
+    password: false
+  - name: HOTDOG_INBOX_HOST
+    description: "Local listener host for ASR→agent inbox (default 127.0.0.1)"
+    prompt: "Inbox host"
+    password: false
+  - name: HOTDOG_INBOX_PORT
+    description: "Local listener port (default 8770)"
+    prompt: "Inbox port"
+    password: false
+  - name: HOTDOG_FOLLOWUP_SECONDS
+    description: "Seconds of follow-up mic after each reply (default 5)"
+    prompt: "Follow-up seconds"
+    password: false

@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# sc — StackChan desk-robot control helper for the Hermes Agent.
+#
+# Wraps two HTTP surfaces, both reachable from the Mac mini that runs Hermes:
+#   - stackproxy   http://localhost:8766/agent/*   (Doubao TTS, status, face, move)
+#   - device firmware  http://<device-ip>/...      (LEDs, screen, head, sensors, events)
+#
+# The device IP is auto-discovered from stackproxy's device list, so this
+# script keeps working across DHCP changes. Override with STACKCHAN_IP if needed.
+set -euo pipefail
+
+PROXY="${STACKCHAN_PROXY:-http://localhost:8766}"
+DEVICE_IP="${STACKCHAN_IP:-}"
+
+# curl that ignores the system proxy — the Mac mini exports http_proxy, which
+# would otherwise hijack localhost / LAN requests.
+cc() { curl --noproxy '*' -sS "$@"; }
+die() { echo "sc: $*" >&2; exit 1; }
+
+resolve_device() {
+  [ -n "$DEVICE_IP" ] && return 0
+  local status
+  status=$(cc --max-time 5 "$PROXY/agent/status" 2>/dev/null) || true
+  DEVICE_IP=$(printf '%s' "$status" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)["devices"]; print(d[0]["remote"].split(":")[0] if d else "")
+except Exception:
+    print("")' 2>/dev/null) || true
+  [ -z "$DEVICE_IP" ] && DEVICE_IP="stackchan.local"
+}
+dev() { resolve_device; printf 'http://%s' "$DEVICE_IP"; }
+
+# jpost <url> <json>  — every device/proxy POST needs an explicit JSON content-type.
+jpost() {
+  cc --max-time "${SC_TIMEOUT:-15}" -X POST "$1" \
+     -H 'Content-Type: application/json' -d "$2"
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  status)
+    cc --max-time 5 "$PROXY/agent/status" | python3 -m json.tool ;;
+
+  say)
+    [ $# -ge 1 ] || die 'usage: sc say "text" [title]'
+    jpost "$PROXY/agent/say" \
+      "$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1],"title":sys.argv[2]}))' \
+         "$1" "${2:-StackChan}")" ;;
+
+  face|express)
+    [ $# -ge 1 ] || die 'usage: sc face <expression>'
+    jpost "$PROXY/agent/express" "{\"expression\":\"$1\"}" ;;
+
+  move|action)
+    [ $# -ge 1 ] || die 'usage: sc move <action>'
+    jpost "$PROXY/agent/move" "{\"name\":\"$1\"}" ;;
+
+  led)
+    [ $# -ge 1 ] || die 'usage: sc led <effect> [r g b] [speed_ms]'
+    name="$1"; shift
+    body="{\"name\":\"$name\""
+    if [ $# -ge 3 ]; then body="$body,\"r\":$1,\"g\":$2,\"b\":$3"; shift 3; fi
+    [ $# -ge 1 ] && body="$body,\"speed_ms\":$1"
+    jpost "$(dev)/led/effect" "$body}" ;;
+
+  display)
+    [ $# -ge 2 ] || die 'usage: sc display "title" "text"'
+    jpost "$(dev)/display" \
+      "$(python3 -c 'import json,sys;print(json.dumps({"title":sys.argv[1],"text":sys.argv[2]}))' \
+         "$1" "$2")" ;;
+
+  big)
+    [ $# -ge 1 ] || die 'usage: sc big "text" [colorhex]'
+    jpost "$(dev)/display/big" \
+      "$(python3 -c 'import json,sys;d={"text":sys.argv[1]}
+if len(sys.argv)>2 and sys.argv[2]:d["color"]=sys.argv[2]
+print(json.dumps(d))' "$1" "${2:-}")" ;;
+
+  head)
+    [ $# -ge 2 ] || die 'usage: sc head <x:-1..1> <y:-1..1> [speed]'
+    jpost "$(dev)/head/normalized" "{\"x\":$1,\"y\":$2,\"speed\":${3:-600}}" ;;
+
+  sensors)
+    cc --max-time 6 "$(dev)/sensors" | python3 -m json.tool ;;
+
+  events)
+    cc --max-time 6 "$(dev)/events?since=${1:-0}" | python3 -m json.tool ;;
+
+  idle)
+    v=$([ "${1:-on}" = off ] && echo false || echo true)
+    jpost "$(dev)/idle" "{\"enabled\":$v}" ;;
+
+  breathing)
+    v=$([ "${1:-on}" = off ] && echo false || echo true)
+    jpost "$(dev)/breathing" "{\"enabled\":$v}" ;;
+
+  look)
+    if [ "${1:-}" != "--force" ]; then
+      cat >&2 <<'EOF'
+sc: camera capture is DISABLED.
+sc: /agent/look triggers a firmware bug (esp_camera lockup) that WEDGES the
+sc: device — it stops responding to WiFi, WS, and HTTP, and a WS reconnect
+sc: does NOT fix it. Recovery requires a PHYSICAL POWER CYCLE of the device.
+sc: This was confirmed in production on 2026-05-14.
+sc:
+sc: Do not use the camera. If the user explicitly insists and accepts that
+sc: they may have to walk over and re-plug the device, re-run:
+sc:     sc look --force [outfile]
+EOF
+      exit 1
+    fi
+    shift
+    out="${1:-/tmp/stackchan_look.jpg}"
+    echo "sc: --force given — attempting camera capture. This may wedge the device." >&2
+    code=$(cc --max-time 35 -X POST "$PROXY/agent/look" -o "$out" -w '%{http_code}')
+    [ "$code" = 200 ] || die "look failed (HTTP $code) — device is likely wedged now; it needs a physical power cycle"
+    echo "$out" ;;
+
+  dev)
+    # raw device-firmware call:  sc dev GET /sensors  |  sc dev POST /led/effect '{"name":"fire"}'
+    [ $# -ge 2 ] || die 'usage: sc dev GET|POST <path> [json]'
+    if [ "$1" = GET ]; then cc --max-time 10 "$(dev)$2"
+    else jpost "$(dev)$2" "${3:-{\}}"; fi ;;
+
+  proxy)
+    # raw stackproxy call:  sc proxy GET /agent/status  |  sc proxy POST /agent/mic/toggle
+    [ $# -ge 2 ] || die 'usage: sc proxy GET|POST <path> [json]'
+    if [ "$1" = GET ]; then cc --max-time 10 "$PROXY$2"
+    else jpost "$PROXY$2" "${3:-{\}}"; fi ;;
+
+  help|*)
+    cat >&2 <<'EOF'
+sc — StackChan desk-robot control
+  sc status                    device list + connection state
+  sc say "text" [title]        speak aloud (Doubao TTS via stackproxy)
+  sc face <expr>               neutral happy sad angry surprised thinking
+                               sleep love smile stare talking wink_l cat ...
+  sc move <action>             home nod shake yes no left right look_up
+                               look_down look_around dance bow wake sleep
+                               surprised panic peek tilt_left tilt_right
+  sc led <effect> [r g b] [ms] rainbow breathing pulse scanner wipe sparkle
+                               police fire chase theater listening thinking
+                               talking recording solid off
+  sc display "title" "text"    paginated UTF-8 text on screen
+  sc big "text" [colorhex]     one large centered string
+  sc head <x> <y> [speed]      aim head, x/y normalized -1..1, speed 0-1000
+  sc sensors                   IMU + compass + touch + battery snapshot
+  sc events [sinceId]          drain the physical-event ring buffer
+  sc idle on|off               random subtle head sway (makes it feel alive)
+  sc breathing on|off          gentle pitch oscillation
+  sc look [outfile]            camera JPEG  — DISABLED, wedges the device
+                               (needs --force + a physical power cycle to recover)
+  sc dev GET|POST <path> [json]    escape hatch: raw device-firmware call
+  sc proxy GET|POST <path> [json]  escape hatch: raw stackproxy call
+EOF
+    [ "$cmd" = help ] && exit 0 || exit 1 ;;
+esac

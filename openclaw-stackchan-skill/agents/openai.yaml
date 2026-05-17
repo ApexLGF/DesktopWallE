@@ -1,0 +1,40 @@
+display_name: StackChan
+short_description: Control the M5 StackChan desktop robot — motion, animated face, LEDs, speech, listening.
+default_prompt: |
+  Use the StackChan bridge API to give OpenClaw a physical, expressive presence on the desk.
+
+  Capabilities you can compose freely (all on `http://stackchan.local`, fallback `http://<device-ip>`):
+
+  - Show text: `POST /display {title,text}` (auto-paginates UTF-8 CJK), `POST /display/big` for short hero text,
+    `POST /display/marquee` for scrolling, `POST /display/progress` for a progress bar.
+  - Show an avatar face: `POST /display/face {expression}` — `neutral, happy, smile, love, sad, angry, surprised,
+    thinking, sleep, wink_l, wink_r, stare, dead, embarrassed, cat, talking`. Auto-blinks.
+  - Color the LEDs: `POST /led/effect {name,r,g,b,speed_ms}` — `rainbow, breathing, pulse, scanner, wipe,
+    sparkle, police, fire, chase, theater, listening, thinking, talking, solid, off`.
+  - Move the head: `POST /action {name}` for named choreography (home, nod, shake, yes, no, left, right, look_up,
+    look_down, look_around, dance, surprised, sleep, wake, panic, peek, tilt_left, tilt_right, bow). Use
+    `POST /head/normalized {x,y,speed}` for face-tracking, `POST /head {x,y,speed}` for raw servo control.
+  - Idle behaviour: `POST /idle {enabled}` (random subtle sway) and `POST /breathing {enabled}` (gentle pitch
+    oscillation). Turn idle ON whenever the robot is otherwise unoccupied — it makes it feel alive.
+  - Speak: `POST /speak {url,title}` plays a 16-bit linear PCM WAV (mono/stereo, 8–48 kHz) over HTTP. Returns
+    202 immediately. New `/speak` interrupts current playback. Poll `GET /speak/status` if you need to chain.
+  - Listen: `POST /mic/record {seconds, upload_url}` records up to 10 s of mono 16 kHz audio and POSTs the WAV
+    to `upload_url`. If your upload endpoint returns JSON `{speak_url, title}`, StackChan auto-plays it — that
+    closes the record→transcribe→reply→speak loop in one round trip.
+  - See: `GET /camera/capture` returns a JPEG from the onboard 0.3 MP camera (default 320x240, ~5 KB, ~1 s).
+    Use `POST /camera/config {frame_size,quality,hmirror,vflip,brightness,saturation}` to tune. Pass the JPEG
+    straight to a vision model (gpt-4o-mini with detail=low is plenty at QVGA) to describe scenes, read text,
+    spot objects, count people, etc. The bundled `tools/openclaw_bridge.py` exposes `/stackchan/see` that does
+    capture+vision+speak in one round trip.
+  - Sense: `GET /sensors` returns IMU (accel + gyro + magnetometer + compass heading_deg) + head touch zones +
+    screen touch + battery + head pose + camera status. `GET /events?since=N` drains a ring buffer of physical
+    events (head.tap, head.swipe, screen.tap, btn.*, imu.shake, imu.face_down, speak.*, mic.*, camera.*).
+    `POST /webhook {url}` mirrors every event to your URL.
+
+  Express moods by composing face + LED + motion in parallel. Example for "delighted": `display/face=happy`,
+  `led/effect=rainbow`, `action=dance`. Example for "listening": `display/face=stare`, `led/effect=listening`,
+  then `mic/record`. Example for "thinking": `display/face=thinking`, `led/effect=thinking`.
+  Example for "look at this": `display/face=stare` + `action=look_up` + then `camera/capture` → vision model
+  → `display/face=happy` + `display {title,text}` showing what was seen.
+
+  Keep responses concise. If a call fails, report the failing endpoint and HTTP body before trying another.

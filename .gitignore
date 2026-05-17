@@ -1,0 +1,37 @@
+# Firmware build artifacts
+.pio/
+.pio-core/
+.arduino-build/
+.arduino-cache/
+build/
+*.elf
+*.bin
+
+# Local device config (per-checkout secrets — Wi-Fi password, auth token)
+include/config.h
+
+# Bridge runtime config + caches
+bridge/config.toml
+bridge/__pycache__/
+bridge/*.log
+bridge/cap-*.pcm
+bridge/cap-*.raw
+bridge/cap-*.wav
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Backup files left by editors / sed
+*.bak
+*.bak-*
+
+# Local secrets
+.env
+.env.local

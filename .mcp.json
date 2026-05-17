@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "espressif-docs": {
+      "type": "http",
+      "url": "https://mcp.espressif.com/docs"
+    },
+    "esp-components": {
+      "type": "http",
+      "url": "https://components.espressif.com/mcp"
+    }
+  }
+}

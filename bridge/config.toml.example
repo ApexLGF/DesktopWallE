@@ -1,0 +1,27 @@
+# DesktopWallE bridge config — copy to ~/.stackproxy/config.toml or
+# bridge/config.toml and fill in your own Volcengine (Doubao) credentials.
+#
+# Get them from the Volcengine speech console:
+#   https://console.volcengine.com/speech/
+
+[doubao]
+appid        = "<YOUR_DOUBAO_APP_ID>"
+access_token = "<YOUR_DOUBAO_ACCESS_TOKEN>"
+secret_key   = "<YOUR_DOUBAO_SECRET_KEY>"   # optional, only for signed APIs
+
+# WebSocket server: where StackChan devices connect.
+[ws]
+host = "0.0.0.0"
+port = 8765
+
+# Admin HTTP server: curl / agent-side adapters hit this for /say, /rpc, etc.
+[http]
+host = "127.0.0.1"
+port = 8766
+
+# Optional: Hermes / OpenClaw gateway URL the bridge can call when an ASR
+# transcript needs a reply. Leave empty to disable the agent loop and use
+# the bridge as a pure protocol translator.
+[agent]
+hermes_url   = ""
+openclaw_url = ""
