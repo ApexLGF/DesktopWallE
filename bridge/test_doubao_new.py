@@ -10,7 +10,9 @@ Passes if BOTH of the following are true:
 Exits 0 on full success, 1 on any failure. Prints a structured report.
 
 Usage:
-    DOUBAO_APP_KEY=... DOUBAO_ACCESS_KEY=... python3 test_doubao_new.py
+    cp bridge/config.toml.example bridge/config.toml   # if not done yet
+    # edit bridge/config.toml — fill in [doubao] appid + access_token
+    python3 bridge/test_doubao_new.py
 """
 from __future__ import annotations
 
@@ -21,13 +23,16 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import config as bridge_config
 import doubao_asr_flash as asr
 import doubao_tts_unidirectional as tts
 
-APP_KEY    = os.environ.get("DOUBAO_APP_KEY")
-ACCESS_KEY = os.environ.get("DOUBAO_ACCESS_KEY")
-if not APP_KEY or not ACCESS_KEY:
-    sys.exit("set DOUBAO_APP_KEY and DOUBAO_ACCESS_KEY before running")
+try:
+    _creds = bridge_config.get_doubao()
+except RuntimeError as e:
+    sys.exit(str(e))
+APP_KEY    = _creds.appid
+ACCESS_KEY = _creds.access_token
 
 TEST_TEXTS = [
     "今天天气真不错",

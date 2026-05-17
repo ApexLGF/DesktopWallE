@@ -1,27 +1,56 @@
-# DesktopWallE bridge config — copy to ~/.stackproxy/config.toml or
-# bridge/config.toml and fill in your own Volcengine (Doubao) credentials.
+# DesktopWallE bridge config.
+# ─────────────────────────────────────────────────────────────────────
+# Copy this file to `bridge/config.toml` (preferred) and fill in your
+# own keys. Both `bridge/config.toml` and `~/.stackproxy/config.toml`
+# are gitignored, so your keys NEVER end up in the repo.
 #
-# Get them from the Volcengine speech console:
-#   https://console.volcengine.com/speech/
+#     cp bridge/config.toml.example bridge/config.toml
+#     $EDITOR bridge/config.toml
+#
+# The bridge loads config in this priority order:
+#   1. bridge/config.toml         (next to server.py, preferred)
+#   2. ~/.stackproxy/config.toml  (legacy install layout, still works)
+# ─────────────────────────────────────────────────────────────────────
 
+
+# Volcengine "Doubao" speech credentials.
+# Get them from https://console.volcengine.com/speech/  →  应用管理
+#
+# Both Flash ASR (/api/v3/auc/bigmodel/recognize/flash) and chunked TTS
+# (/api/v3/tts/unidirectional) use the same appid + access_token. The
+# legacy v1 endpoints additionally need secret_key — leave it blank if
+# you only use the v3 endpoints (which is what this project does).
 [doubao]
-appid        = "<YOUR_DOUBAO_APP_ID>"
+appid        = "<YOUR_DOUBAO_APPID>"
 access_token = "<YOUR_DOUBAO_ACCESS_TOKEN>"
-secret_key   = "<YOUR_DOUBAO_SECRET_KEY>"   # optional, only for signed APIs
+secret_key   = ""   # optional; only for signed v1 APIs
+
 
 # WebSocket server: where StackChan devices connect.
+# Match `STACKPROXY_WS_HOST` in your device's include/config.h.
 [ws]
 host = "0.0.0.0"
 port = 8765
 
-# Admin HTTP server: curl / agent-side adapters hit this for /say, /rpc, etc.
+
+# Admin HTTP server: curl / agent-side adapters hit this for
+# /say, /rpc, /voice, /face, etc.
 [http]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 8766
 
-# Optional: Hermes / OpenClaw gateway URL the bridge can call when an ASR
-# transcript needs a reply. Leave empty to disable the agent loop and use
-# the bridge as a pure protocol translator.
+
+# MCP server (optional): exposes the admin HTTP API as MCP tools so any
+# MCP-aware LLM client (Claude Desktop, etc.) can drive the device.
+[mcp]
+host       = "0.0.0.0"
+port       = 8767
+bridge_url = "http://127.0.0.1:8766"
+
+
+# Agent gateway (optional): where the bridge POSTs a final ASR transcript
+# to get a reply. Leave both empty to use the bridge as a pure protocol
+# translator — no agent loop.
 [agent]
-hermes_url   = ""
-openclaw_url = ""
+hermes_url   = ""   # e.g. http://127.0.0.1:18790/api/gateway/hotdog.invoke
+openclaw_url = ""   # e.g. http://127.0.0.1:18789/api/gateway/stackproxy.invoke

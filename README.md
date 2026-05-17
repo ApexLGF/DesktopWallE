@@ -43,13 +43,30 @@ Inspired by Pixar's Wall‑E — small, expressive, and very chatty.
 
 ## Quick start
 
-### 1. Flash the firmware
+### 1. Create the two local config files
+
+Both are **gitignored** — your keys never leave your machine.
 
 ```sh
+# Device-side config (Wi-Fi, bridge host, optional auth token)
 cp include/config.example.h include/config.h
-# Edit your 2.4 GHz Wi-Fi SSID/password.
-# Set STACKPROXY_WS_HOST to the LAN IP of the machine that will run the bridge.
+$EDITOR include/config.h
 
+# Bridge-side config (Doubao keys, server ports, agent URLs)
+cp bridge/config.toml.example bridge/config.toml
+$EDITOR bridge/config.toml
+```
+
+You only need to fill in:
+
+- `include/config.h`  — `STACKCHAN_WIFI_SSID` / `STACKCHAN_WIFI_PASSWORD` and `STACKPROXY_WS_HOST` (the LAN IP of whatever machine will run the bridge).
+- `bridge/config.toml` — `[doubao] appid` and `access_token` from the [Volcengine speech console](https://console.volcengine.com/speech/).
+
+Everything else has sensible defaults.
+
+### 2. Flash the firmware
+
+```sh
 arduino-cli compile --fqbn m5stack:esp32:m5stack_cores3 \
     --build-path .arduino-build StackChanOpenClaw
 arduino-cli upload  -p /dev/cu.usbmodemXXX --fqbn m5stack:esp32:m5stack_cores3 \
@@ -67,7 +84,7 @@ pio device monitor -p /dev/cu.usbmodemXXX -b 115200
 
 The device boots, joins Wi-Fi, advertises mDNS as `stackchan.local`, and opens a WebSocket to your bridge host. Tap its head; you should see `head.tap` events arrive at the bridge.
 
-### 2. Run the bridge
+### 3. Run the bridge
 
 The bridge is Python 3.13. It expects `ffmpeg` on the PATH for the OPUS encoder.
 
@@ -75,25 +92,25 @@ The bridge is Python 3.13. It expects `ffmpeg` on the PATH for the OPUS encoder.
 brew install ffmpeg python@3.13          # macOS; apt equivalents on Linux
 cd bridge
 python3.13 -m pip install -r requirements.txt
-cp config.toml.example ~/.stackproxy/config.toml
-# edit ~/.stackproxy/config.toml with your Doubao appid + access_token
-
 python3.13 server.py
 ```
 
 You should see:
 
 ```
+config: doubao=ok ws=0.0.0.0:8765 http=0.0.0.0:8766 source=bridge/config.toml
 [ws]    ocsc.v2 listening on 0.0.0.0:8765
 [http]  admin listening on 0.0.0.0:8766
 [ws]    hello <device-id> boot=N fw=1.0.0 caps=[...] remote=...
 [disp]  idle face -> <device-id>
 ```
 
-### 3. Smoke-test the audio path
+If `bridge/config.toml` is missing or has placeholder values, the bridge exits immediately with a one-line fix-up message — no silent crashes mid-call.
+
+### 4. Smoke-test the audio path
 
 ```sh
-DOUBAO_APP_KEY=...  DOUBAO_ACCESS_KEY=...  python3.13 bridge/test_doubao_new.py
+python3.13 bridge/test_doubao_new.py
 ```
 
 Expected output:
@@ -116,12 +133,25 @@ curl -X POST http://<bridge-host>:8766/say \
 
 The device should start speaking within ~600 ms of the POST.
 
-### 4. (Optional) Plug in an agent
+### 5. (Optional) Plug in an agent
 
 The bridge is just a protocol translator. Point it at any chat agent:
 - **Hermes** — copy [`hermes-stackchan-skill/`](hermes-stackchan-skill/) into `~/.hermes/skills/`. The skill exposes `sc` commands like `sc say "hello"`, `sc face happy`, `sc move nod`.
 - **OpenClaw** — copy [`openclaw-stackchan-skill/`](openclaw-stackchan-skill/) into `~/.openclaw/workspace/skills/`. Same idea via OpenClaw's tool API.
 - **Anything else** — the bridge speaks HTTP. Wire it to your own LLM loop in 50 lines of Python.
+
+## Configuration files
+
+This project has exactly two config files — both gitignored, each with a committed `.example`:
+
+| File | What it configures | Loaded by | Template |
+|------|--------------------|-----------|----------|
+| `include/config.h` | Device side: Wi-Fi SSID/password, bridge host:port, optional HTTP auth token | Compiled into firmware at build time | `include/config.example.h` |
+| `bridge/config.toml` | Bridge side: Doubao credentials, WS/HTTP/MCP ports, agent gateway URLs | Read at bridge startup by `bridge/config.py` | `bridge/config.toml.example` |
+
+The bridge loader looks for `bridge/config.toml` first, then falls back to `~/.stackproxy/config.toml` for legacy installs. No environment variables are consulted — the whole runtime contract lives in one TOML file. Run `python3.13 bridge/config.py` to print a masked sanity report (values redacted to first/last 4 chars) and verify your file is being picked up.
+
+To rotate keys: edit the TOML and restart `server.py`. No code change, no env var dance, no .env files.
 
 ## Architecture deep dive
 

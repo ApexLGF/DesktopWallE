@@ -7,8 +7,8 @@ and return raw PCM bytes. Streaming happens on the device side via the bridge
 ocsc.v2 binary path (KIND_TTS_PCM); the device speaker handles the playback
 buffer, so the bridge only needs to chunk the bytes nicely.
 
-Credentials live in ~/.stackproxy/config.toml (carried over from stackproxy),
-or env: HOTDOG_DOUBAO_APPID / _ACCESS_TOKEN.
+Credentials are loaded from bridge/config.toml via bridge.config (see
+bridge/config.toml.example for the schema). There are no env-var fallbacks.
 
 Docs: https://www.volcengine.com/docs/6561/79820
 """
@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 import uuid
-from pathlib import Path
 
 import httpx
+
+import config as bridge_config
 
 log = logging.getLogger("doubao_tts")
 
@@ -30,26 +30,13 @@ TTS_ENDPOINT = "https://openspeech.bytedance.com/api/v1/tts"
 
 
 def _load_creds() -> tuple[str, str]:
-    appid = os.environ.get("HOTDOG_DOUBAO_APPID")
-    token = os.environ.get("HOTDOG_DOUBAO_ACCESS_TOKEN")
-    if appid and token:
-        return appid, token
-    # Fallback: pull from the stackproxy config.toml the user already maintains.
-    cfg = Path.home() / ".stackproxy" / "config.toml"
-    if cfg.exists():
-        try:
-            import tomllib
-        except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore
-        with cfg.open("rb") as f:
-            data = tomllib.load(f)
-        d = data.get("doubao", {})
-        appid = d.get("appid", appid)
-        token = d.get("access_token", token)
-    if not appid or not token:
-        raise RuntimeError("Doubao TTS credentials missing — set HOTDOG_DOUBAO_APPID + "
-                           "HOTDOG_DOUBAO_ACCESS_TOKEN or fill in ~/.stackproxy/config.toml")
-    return appid, token
+    """Return (appid, access_token) from bridge/config.toml.
+
+    Kept as a thin shim because half the codebase calls _load_creds() —
+    new code should call bridge_config.get_doubao() directly.
+    """
+    c = bridge_config.get_doubao()
+    return c.appid, c.access_token
 
 
 async def synthesize(text: str, *, voice: str = DEFAULT_VOICE,

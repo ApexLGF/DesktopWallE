@@ -34,6 +34,7 @@ from protocol import (
 )
 import struct
 import aiohttp
+import config as bridge_config
 import doubao_asr_flash
 import doubao_tts_unidirectional
 import doubao_tts
@@ -1727,17 +1728,25 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ws-host", default="0.0.0.0")
-    ap.add_argument("--ws-port", type=int, default=8765)
-    ap.add_argument("--http-host", default="0.0.0.0")
-    ap.add_argument("--http-port", type=int, default=8766)
+    # Load config first so an early failure (missing config.toml) prints
+    # a clean message before argparse / asyncio.run touch the network.
+    cfg = bridge_config.load()
+    ap = argparse.ArgumentParser(
+        description="DesktopWallE bridge — config defaults come from "
+                    "bridge/config.toml; CLI flags override per-run.")
+    ap.add_argument("--ws-host",   default=cfg.ws.host)
+    ap.add_argument("--ws-port",   type=int, default=cfg.ws.port)
+    ap.add_argument("--http-host", default=cfg.http.host)
+    ap.add_argument("--http-port", type=int, default=cfg.http.port)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    log.info("config: doubao=ok ws=%s:%d http=%s:%d source=%s",
+             args.ws_host, args.ws_port, args.http_host, args.http_port,
+             cfg.source)
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:

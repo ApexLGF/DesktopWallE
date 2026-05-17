@@ -31,12 +31,30 @@ device (ESP32-S3)   ──ws://lan:8765 (ocsc.v2)──▶   bridge/server.py
 
 ## Configure
 
-Copy `config.toml.example` to either `~/.stackproxy/config.toml` (legacy path used by `_load_creds()`) or `bridge/config.toml` and set your Volcengine Doubao keys. You can also override via env:
+```sh
+cp config.toml.example config.toml      # next to server.py
+$EDITOR config.toml                     # fill in [doubao] appid + access_token
+```
+
+`config.toml` is the single source of truth. `bridge/config.py` reads it on startup and exposes typed accessors (`get_doubao()`, `get_ws()`, `get_http()`, `get_mcp()`, `get_agent()`). There are **no environment-variable fallbacks** — if you'd rather configure via env vars, set them in your shell init and put `${...}` references in the TOML by hand.
+
+Loader priority:
+1. `bridge/config.toml` (preferred — sits next to the code)
+2. `~/.stackproxy/config.toml` (legacy — kept working for older installs)
+
+Verify your config is correctly picked up:
 
 ```sh
-export HOTDOG_DOUBAO_APPID=...
-export HOTDOG_DOUBAO_ACCESS_TOKEN=...
+python3.13 config.py
+# source: /path/to/bridge/config.toml
+# doubao.appid:        2380...2817 (len=10)
+# doubao.access_token: PZ5z...0NuK (len=32)
+# ws:    0.0.0.0:8765
+# http:  0.0.0.0:8766
+# ...
 ```
+
+The file is in `.gitignore`. Your keys never leave your machine.
 
 ## Run
 
@@ -45,11 +63,7 @@ python3.13 -m pip install -r requirements.txt
 python3.13 server.py
 ```
 
-Defaults:
-- WebSocket: `0.0.0.0:8765` (device side)
-- HTTP admin: `0.0.0.0:8766` (agent side)
-
-Both can be changed via `config.toml` or CLI flags (see `python3.13 server.py --help`).
+Defaults are read from `config.toml`. CLI flags (`--ws-port`, `--http-port`, ...) can override any single value per run without touching the file — useful for spinning up a second bridge during development.
 
 ## Admin endpoints
 

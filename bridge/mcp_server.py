@@ -25,9 +25,12 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+import config as bridge_config
+
 log = logging.getLogger("mcp")
 
-BRIDGE_URL = os.environ.get("HOTDOG_BRIDGE", "http://127.0.0.1:8766")
+_MCP_CFG    = bridge_config.get_mcp()
+BRIDGE_URL  = _MCP_CFG.bridge_url
 
 
 async def _say(text: str, *, voice: str | None = None,
@@ -70,8 +73,8 @@ def build_app() -> FastMCP:
             "the StackChan motion units (yaw [-1280..1280], pitch [30..870]). "
             "Camera, voice, and face-tracking tools are added in later phases."
         ),
-        host=os.environ.get("HOTDOG_MCP_HOST", "0.0.0.0"),
-        port=int(os.environ.get("HOTDOG_MCP_PORT", "8767")),
+        host=_MCP_CFG.host,
+        port=_MCP_CFG.port,
         stateless_http=True,
     )
 
