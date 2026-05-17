@@ -189,6 +189,8 @@ Style style_for(lcd_state_t s) {
     case LCD_STATE_THINKING:  return {120,  70, 180, "THINK"  };
     case LCD_STATE_SPEAKING:  return {220, 140,  20, "TALK"   };
     case LCD_STATE_ERROR:     return {200,  50,  20, "ERR"    };
+    case LCD_STATE_ASR:       return { 20, 160, 180, "ASR"    };
+    case LCD_STATE_ASR_ERR:   return {180,  60,  40, "ASR ERR"};
     }
     return { 0, 0, 0, "" };
 }
@@ -309,10 +311,18 @@ void lcd_set_state(lcd_state_t s) {
 
 namespace {
 void idle_timer_cb(void *) {
-    // Don't barge in if something raised the screen state in the
-    // meantime — e.g., the next mic.start already came in.
-    if (g_state == LCD_STATE_SPEAKING || g_state == LCD_STATE_HEARD) {
+    // Only auto-flip from "passive" states (something just ended, we're
+    // waiting for the next thing). Active states like LISTENING / THINKING
+    // mean bridge is mid-operation; we shouldn't preempt them.
+    switch (g_state) {
+    case LCD_STATE_SPEAKING:   // post-TTS settle
+    case LCD_STATE_HEARD:      // mic_stop with no follow-up
+    case LCD_STATE_ASR:        // server-side ASR took too long
+    case LCD_STATE_ASR_ERR:    // ASR failed, transient error display
         lcd_set_state(LCD_STATE_IDLE);
+        break;
+    default:
+        break;
     }
 }
 }  // namespace

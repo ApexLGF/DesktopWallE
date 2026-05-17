@@ -136,7 +136,13 @@ extern "C" void app_main(void) {
     if (!models) { ESP_LOGE(TAG, "srmodel_init failed"); return; }
     char *vadn_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     auto *vadnet = (esp_vadn_iface_t *)esp_vadn_handle_from_name(vadn_name);
-    model_iface_data_t *model = vadnet->create(vadn_name, VAD_MODE_1, 1, 128, 1000);
+    // Signature: create(name, mode, channels, min_speech_ms, min_noise_ms).
+    // min_noise_ms = trailing silence required to flip SPEECH→SILENCE. 1000 ms
+    // was too eager — users naturally pause >1 s mid-sentence ("嗯…", thinking
+    // beats), and we were cutting them off and emitting HEARD prematurely.
+    // 2000 ms gives breathing room without making the device feel sluggish to
+    // wrap up at a real end-of-utterance.
+    model_iface_data_t *model = vadnet->create(vadn_name, VAD_MODE_1, 1, 128, 2000);
     const int frame_samps = vadnet->get_samp_chunksize(model);
     const int model_sr    = vadnet->get_samp_rate(model);
     ESP_LOGI(TAG, "VADNet: %d Hz × %d samples (%d ms)", model_sr, frame_samps,
@@ -150,11 +156,15 @@ extern "C" void app_main(void) {
         wakenet  = (esp_wn_iface_t *)esp_wn_handle_from_name(wn_name);
         wn_model = wakenet->create(wn_name, DET_MODE_90);
         wn_chunk = wakenet->get_samp_chunksize(wn_model);
-        // Default threshold from the model file is ~0.63 which is tuned for
-        // clean AFE-processed audio. We feed raw mic (75 dB gain, no AEC/NS),
-        // so lower the threshold to compensate for the noisier input. Trade
-        // false-accepts here for never-fires.
-        wakenet->set_det_threshold(wn_model, 0.4f, 1);
+        // Threshold tuning history:
+        //   0.63 — model default, tuned for clean AFE-processed audio.
+        //          Never fires on our raw-mic pipeline.
+        //   0.40 — current. Compensates for our 75 dB raw gain + no AEC.
+        //          Earlier "false wakes from typing" turned out to be
+        //          mis-classified Si12T touch events leaking through as
+        //          taps, not WakeNet itself. With MIN_TAP_LEVEL=2 on the
+        //          touch driver, this threshold is safe to leave low.
+        wakenet->set_det_threshold(wn_model, 0.40f, 1);
         float thr = wakenet->get_det_threshold(wn_model, 1);
         ESP_LOGI(TAG, "WakeNet: model=%s chunk=%d threshold=%.2f — \"Hi Wall-E\"",
                  wn_name, wn_chunk, thr);
@@ -230,6 +240,14 @@ extern "C" void app_main(void) {
     int64_t     t0_us         = esp_timer_get_time();
     int         frames        = 0;
     int         heartbeat_period = 1000 / (frame_samps * 1000 / model_sr);   // ≈31 frames
+    // Frame-count threshold for "this is real speech, not just wake-word
+    // tail". 1280 ms ≈ 40 frames at 32 ms/frame. Wake word "Hi Wall-E"
+    // streamed-during-mic tail is typically ~700 ms (mic_start arrives
+    // partway through the wake word). 40 frames is safely above wake-tail
+    // duration but reachable by any real command.
+    const int   speech_real_frames = (40 * 32) / (frame_samps * 1000 / model_sr);
+    int         speech_frames_listen = 0;     // cumulative SPEECH while streaming
+    bool        prev_streaming_listen = false;
 
     while (true) {
         int got = mic_read_multi(multi, frame_samps);
@@ -271,17 +289,43 @@ extern "C" void app_main(void) {
                      prev == VAD_SPEECH ? "SPEECH" : "SILENCE",
                      cur  == VAD_SPEECH ? "SPEECH" : "SILENCE",
                      bridge_ws_is_connected(), bridge_ws_mic_streaming());
-            // SILENCE→SPEECH: tag the turn as "user actually spoke" so the
-            // mic_stop handler can pick HEARD vs IDLE correctly.
+            // SILENCE→SPEECH edge during streaming: clear "real speech" tag.
             if (prev == VAD_SILENCE && cur == VAD_SPEECH) {
                 bridge_ws_mark_speech_observed();
             }
-            // SPEECH→SILENCE while streaming = end-of-utterance.
-            if (prev == VAD_SPEECH && cur == VAD_SILENCE && bridge_ws_mic_streaming()) {
+            // SPEECH→SILENCE while streaming = candidate end-of-utterance.
+            // Two layers of confidence required to actually fire mic.end:
+            //   1) bridge_ws_saw_speech()  — either a fresh SILENCE→SPEECH
+            //      edge happened during streaming, OR cumulative SPEECH
+            //      passed the speech_real_frames threshold (handles the
+            //      "user speaks immediately after wake with no SILENCE gap"
+            //      case where no fresh edge ever fires).
+            //   2) without that gate, wake-word's tail SPEECH→SILENCE trips
+            //      mic.end before the user has even begun their command.
+            if (prev == VAD_SPEECH && cur == VAD_SILENCE &&
+                    bridge_ws_mic_streaming() && bridge_ws_saw_speech()) {
                 bridge_ws_signal_speech_end("vad");
                 lcd_set_state(LCD_STATE_HEARD);
             }
             prev = cur;
+        }
+        // Cumulative-SPEECH path: also mark saw_speech once enough
+        // streaming SPEECH frames accumulate, even without a fresh
+        // SILENCE→SPEECH edge. Required for the continuous-speech case.
+        {
+            bool now_streaming = bridge_ws_mic_streaming();
+            if (!prev_streaming_listen && now_streaming) {
+                speech_frames_listen = 0;     // fresh mic_start, reset counter
+            }
+            prev_streaming_listen = now_streaming;
+            if (now_streaming && cur == VAD_SPEECH) {
+                ++speech_frames_listen;
+                if (speech_frames_listen == speech_real_frames) {
+                    bridge_ws_mark_speech_observed();
+                    ESP_LOGI(TAG, "vad cumulative SPEECH passed %d frames → saw_speech",
+                             speech_real_frames);
+                }
+            }
         }
         // LCD → IDLE used to fire here on mic-stream end, but that races
         // the bridge — Hermes can take 80 s to think and bridge wouldn't

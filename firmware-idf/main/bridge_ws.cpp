@@ -132,17 +132,20 @@ void handle_req(cJSON *root) {
         bool had_speech    = g_saw_speech;
         g_mic_streaming = false;
         send_res_ok(rpc_id, nullptr);
+        // mic_stop → "ASR" state (we sent audio, bridge is now running
+        // its server-side Doubao Flash ASR). Subsequent show_text frames
+        // from bridge ("已听到 ✓" → HEARD, "请再说一次" → ASR_ERR, "没听到"
+        // → IDLE, "思考中" → THINK) advance the state. The 15 s auto-IDLE
+        // fallback handles the case where bridge has nothing more to say.
+        lcd_set_state(LCD_STATE_ASR);
+        lcd_arm_idle_in(15000);
         if (was_streaming && !had_speech) {
-            // The bridge timed out a LISTEN window with no speech at all.
-            // Don't claim "HEARD" — fall back to IDLE so the user sees
-            // the device is dormant, and emit `evt mic.timeout reason=no_speech`
-            // so bridge logic can stop auto-cycling LISTEN.
-            lcd_set_state(LCD_STATE_IDLE);
+            // Hint to bridge that local VAD never saw speech — bridge can
+            // skip the Doubao call entirely (saves ~1.5 s + ¥).
             send_text("{\"t\":\"evt\",\"name\":\"mic.timeout\",\"d\":{\"reason\":\"no_speech\"}}");
-            ESP_LOGI(TAG, "mic streaming off (server stop, no speech → LCD=IDLE)");
+            ESP_LOGI(TAG, "mic streaming off (no speech → LCD=ASR, IDLE in 15s)");
         } else {
-            lcd_set_state(LCD_STATE_HEARD);
-            ESP_LOGI(TAG, "mic streaming off (server stop, LCD=HEARD)");
+            ESP_LOGI(TAG, "mic streaming off (LCD=ASR, IDLE in 15s)");
         }
     } else if (strcmp(method, "show_text") == 0) {
         // Bridge sends rich text we don't fully render yet — peek at the
@@ -152,10 +155,17 @@ void handle_req(cJSON *root) {
         if (cJSON_IsString(title_j)) {
             const char *t = title_j->valuestring;
             // titles we recognize (in priority order):
-            //   "思考中" → THINKING   "已听到" → HEARD
-            //   "回复"   → SPEAKING   "请讲"   → LISTENING
-            //   "继续吗" → LISTENING
+            //   "思考中"     → THINKING   "已听到" → HEARD
+            //   "回复"       → SPEAKING   "请讲"   → LISTENING
+            //   "继续吗"     → LISTENING  "识别中" → ASR (server doing Doubao Flash)
+            //   "请再说"     → ASR_ERR (retry prompt — ASR returned nothing)
+            //   "没听清"     → ASR_ERR
+            //   "识别失败"   → ASR_ERR
+            //   "没听到"     → IDLE (no audio captured / RMS-only noise — bridge skipped ASR)
             //   anything else → leave state untouched
+            // Most-specific patterns must be checked before broader ones
+            // (e.g. "识别失败" before plain "识别"), and any 请-prefixed
+            // title that's NOT "请讲" should land on ASR_ERR.
             if (strstr(t, "\xe6\x80\x9d\xe8\x80\x83")) {
                 lcd_set_state(LCD_STATE_THINKING);
                 // Title is like "思考中… 5秒" — pull the digits out so we
@@ -175,6 +185,32 @@ void handle_req(cJSON *root) {
             }
             else if (strstr(t, "\xe5\xb7\xb2\xe5\x90\xac")) lcd_set_state(LCD_STATE_HEARD);
             else if (strstr(t, "\xe5\x9b\x9e\xe5\xa4\x8d")) lcd_set_state(LCD_STATE_SPEAKING);
+            // 识别失败 = E8 AF 86 E5 88 AB E5 A4 B1 E8 B4 A5
+            // ASR errors are terminal for the conversation turn — bridge
+            // already ended its voice_loop. Arm a 3 s auto-IDLE so the
+            // user sees the error briefly then the screen returns to a
+            // ready state, rather than sitting on ASR ERR forever.
+            else if (strstr(t, "\xe8\xaf\x86\xe5\x88\xab\xe5\xa4\xb1\xe8\xb4\xa5")) {
+                lcd_set_state(LCD_STATE_ASR_ERR);
+                lcd_arm_idle_in(3000);
+            }
+            // 识别 (without 失败) = E8 AF 86 E5 88 AB — bridge sends "识别中…"
+            else if (strstr(t, "\xe8\xaf\x86\xe5\x88\xab"))
+                lcd_set_state(LCD_STATE_ASR);
+            // 请再 = E8 AF B7 E5 86 8D — voice_loop's "请再说一次" (legacy
+            // path — we no longer retry, but keep the mapping in case)
+            else if (strstr(t, "\xe8\xaf\xb7\xe5\x86\x8d")) {
+                lcd_set_state(LCD_STATE_ASR_ERR);
+                lcd_arm_idle_in(3000);
+            }
+            // 没听清 = E6 B2 A1 E5 90 AC E6 B8 85
+            else if (strstr(t, "\xe6\xb2\xa1\xe5\x90\xac\xe6\xb8\x85")) {
+                lcd_set_state(LCD_STATE_ASR_ERR);
+                lcd_arm_idle_in(3000);
+            }
+            // 没听到 = E6 B2 A1 E5 90 AC E5 88 B0 — bridge said "no audio"
+            else if (strstr(t, "\xe6\xb2\xa1\xe5\x90\xac\xe5\x88\xb0"))
+                lcd_set_state(LCD_STATE_IDLE);
             else if (strstr(t, "\xe8\xaf\xb7\xe8\xae\xb2") ||
                      strstr(t, "\xe7\xbb\xa7\xe7\xbb\xad")) lcd_set_state(LCD_STATE_LISTENING);
         }
@@ -294,6 +330,12 @@ void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_da
         g_connected     = false;
         g_hello_acked   = false;
         g_mic_streaming = false;
+        // Drop any in-flight audio + flip the screen back to the BRIDGE
+        // "(re)connecting" state. Hardware: the LCD panel retains the
+        // previous frame until something repaints, so without this the
+        // user stares at LISTEN / TALK / THINK forever while we re-handshake.
+        speaker_stop();
+        lcd_set_state(LCD_STATE_BRIDGE);
         break;
     case WEBSOCKET_EVENT_DATA: {
         // IDF's esp_websocket_client splits a single ws frame into one
@@ -337,6 +379,7 @@ void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_da
 bool bridge_ws_is_connected(void)   { return g_connected && g_hello_acked; }
 bool bridge_ws_mic_streaming(void)  { return bridge_ws_is_connected() && g_mic_streaming; }
 void bridge_ws_mark_speech_observed(void) { if (g_mic_streaming) g_saw_speech = true; }
+bool bridge_ws_saw_speech(void)     { return g_saw_speech; }
 
 esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
                            const char *device_id, uint32_t boot_count,
@@ -351,7 +394,10 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
 
     esp_websocket_client_config_t cfg = {};
     cfg.uri                       = uri;
-    cfg.reconnect_timeout_ms      = 5000;
+    // Aggressive reconnect: transient WS drops (TCP send-buffer full, brief
+    // WiFi roam) shouldn't make the user wait 5 s staring at the BRIDGE
+    // screen. 1.5 s gets us back online before the user notices.
+    cfg.reconnect_timeout_ms      = 1500;
     cfg.network_timeout_ms        = 10000;
     cfg.buffer_size               = 4096;    // OPUS packets are <200 B; this is plenty
     // Default 4 KB task stack overflows when we mix cJSON + send_bin
@@ -361,8 +407,18 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     cfg.task_prio                 = 5;
     // Don't auto-disconnect on missed pong — wifi RSSI here is -70 dB
     // and we'd rather miss a heartbeat than tear the audio stream.
+    // WS keepalive: send a ping frame every 30 s so the path's NAT /
+    // session table sees traffic and doesn't evict the connection. WS pings
+    // are 2-byte control frames; cheap. Without this the link sat silent
+    // for minutes between turns and got dropped by router/AP NAT every
+    // 3-5 minutes (matched typical NAT TCP idle timeouts).
+    //
+    // disable_pingpong_discon=true: ping is for *keepalive*, not health
+    // check. We don't want a transient pong loss to kill an otherwise
+    // healthy connection — if the WS is truly dead, transport_poll_write
+    // failures or TCP RST will surface it within a frame or two.
     cfg.disable_pingpong_discon   = true;
-    cfg.ping_interval_sec         = 0;     // disable client-side pings
+    cfg.ping_interval_sec         = 30;
     g_client = esp_websocket_client_init(&cfg);
     if (!g_client) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");

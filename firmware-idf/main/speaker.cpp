@@ -209,9 +209,14 @@ void speaker_task(void *arg) {
             close_after_playback();
             g_active = false;
             bridge_ws_send_tts_done(c.sid);
-            // Give the bridge a beat to start the next turn (mic_start
-            // will cancel this), then settle the LCD back to IDLE.
-            lcd_arm_idle_in(2000);
+            // Settle the LCD back to IDLE if the bridge has nothing
+            // queued. We learned the hard way that 2 s is too aggressive
+            // — Hermes-driven bridges can take 3-4 s before sending the
+            // next `mic_start` (agent post-processing, hooks, etc.). The
+            // user then sees a TALK → IDLE → LISTEN flicker right as
+            // they're starting to speak the next turn. 5 s gives breathing
+            // room; any state change cancels the timer.
+            lcd_arm_idle_in(5000);
             continue;
         }
         if (!c.pcm) continue;

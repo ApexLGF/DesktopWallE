@@ -42,6 +42,15 @@ CONFIG_SR_VADN_VADNET1_MEDIUM=y
 # emitting this from the device gives us hands-free conversation.
 CONFIG_SR_WN_WN9_HIWALLE_TTS2=y
 
+# ─── LWIP / TCP tuning ──────────────────────────────────────────────────
+# Default LWIP SND_BUF (5760) is too small for our 32 KB/s mic upload
+# during a LISTEN turn; transient WiFi jitter fills the send buffer →
+# transport_poll_write returns 0 → IDF ws_client treats as fatal and
+# closes the connection. 32 KB gives ~10 frames headroom before the
+# nonblocking write fails.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
 # ─── Logging ─────────────────────────────────────────────────────────────
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y

@@ -23,6 +23,8 @@ typedef enum {
     LCD_STATE_THINKING  = 6,  // purple + "THINK"
     LCD_STATE_SPEAKING  = 7,  // orange + "TALK"
     LCD_STATE_ERROR     = 8,  // red + "ERR"
+    LCD_STATE_ASR       = 9,  // cyan + "ASR" — mic closed, server-side ASR running
+    LCD_STATE_ASR_ERR   = 10, // dim red + "ASR ERR" — ASR returned nothing
 } lcd_state_t;
 
 esp_err_t lcd_init(void);

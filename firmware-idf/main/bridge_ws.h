@@ -55,6 +55,13 @@ void bridge_ws_signal_speech_end(const char *reason);
 // any speech" so the LCD doesn't lie about HEARD.
 void bridge_ws_mark_speech_observed(void);
 
+// True if SILENCE→SPEECH was observed during the current streaming
+// turn. Used by the mic loop to gate `signal_speech_end` — without
+// this, a SPEECH state that pre-dated mic_start (i.e., the user is
+// still mid-wake-word when LISTEN opens) flips straight to HEARD on
+// the wake-word's tail, before the actual command even starts.
+bool bridge_ws_saw_speech(void);
+
 // Emit `evt tts.done sid=<sid>` to the bridge. Called by speaker.cpp
 // when the playback queue has drained past its end-of-utterance
 // sentinel. Lets the bridge release its tts_lock and stop suppressing

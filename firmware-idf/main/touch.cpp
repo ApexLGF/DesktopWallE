@@ -42,6 +42,12 @@ constexpr uint8_t  SENS_LOW_LV3      = 0x33;
 
 constexpr int      POLL_MS           = 50;
 constexpr int      COOLDOWN_MS       = 400;
+// Minimum response intensity that counts as a real "tap" (1=LOW=NEAR,
+// 2=MID=LIGHT_TOUCH, 3=HIGH=FIRM_PRESS). Capacitive coupling from a
+// hand 20-30 cm away (user sitting at the desk in front of the device)
+// shows up as LOW; that's not a touch and used to cause false wakes
+// while the user was just typing on a keyboard.
+constexpr uint8_t  MIN_TAP_LEVEL     = 2;
 
 i2c_master_dev_handle_t g_dev        = nullptr;
 TaskHandle_t            g_task       = nullptr;
@@ -108,13 +114,15 @@ void poll_task(void *arg) {
         bool in_cooldown =
             (xTaskGetTickCount() - last_fire_tick) < pdMS_TO_TICKS(COOLDOWN_MS);
 
-        // Edge: any pad that just transitioned from NONE → ≥LOW counts
-        // as a tap. We OR them so a hand covering all three pads only
-        // fires once.
+        // Edge: any pad that just transitioned from <MIN_TAP_LEVEL to
+        // ≥MIN_TAP_LEVEL counts as a tap. LOW (1) is treated as a non-tap
+        // baseline so hand-proximity capacitive coupling doesn't false-fire.
+        // We OR multiple pads firing in the same poll so a palm covering
+        // the whole strip still only fires once.
         int fired = -1;
         int fired_count = 0;
         for (int i = 0; i < 3; ++i) {
-            if (prev[i] == 0 && cur[i] > 0) {
+            if (prev[i] < MIN_TAP_LEVEL && cur[i] >= MIN_TAP_LEVEL) {
                 if (fired < 0) fired = i;
                 ++fired_count;
             }
