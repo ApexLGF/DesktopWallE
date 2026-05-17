@@ -15,6 +15,8 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 
+#include "lcd.h"
+
 static const char *TAG = "bridge_ws";
 
 namespace {
@@ -112,21 +114,38 @@ void handle_req(cJSON *root) {
                  "{\"t\":\"mic.start\",\"sid\":%u,\"sr\":16000,\"fmt\":\"pcm16\"}",
                  (unsigned)sid);
         send_text(buf);
-        // Loud serial banner so the user has a clear cue to speak (the
-        // LCD `show_text` isn't wired up yet in this firmware).
-        ESP_LOGW(TAG, "");
-        ESP_LOGW(TAG, "==========================================");
-        ESP_LOGW(TAG, "  🎤 MIC OPEN — TALK NOW  (sid=%u)", (unsigned)sid);
-        ESP_LOGW(TAG, "==========================================");
+        // Visible cue on the LCD so the user knows to speak.
+        lcd_set_state(LCD_STATE_LISTENING);
+        ESP_LOGI(TAG, "mic streaming on, sid=%u (LCD=LISTEN)", (unsigned)sid);
     } else if (strcmp(method, "mic_stop") == 0) {
         g_mic_streaming = false;
+        lcd_set_state(LCD_STATE_HEARD);
         send_res_ok(rpc_id, nullptr);
-        ESP_LOGI(TAG, "mic streaming off (server stop)");
+        ESP_LOGI(TAG, "mic streaming off (server stop, LCD=HEARD)");
+    } else if (strcmp(method, "show_text") == 0) {
+        // Bridge sends rich text we don't fully render yet — peek at the
+        // title to infer agent state and update the LCD color accordingly.
+        const cJSON *p_j     = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *title_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "title") : nullptr;
+        if (cJSON_IsString(title_j)) {
+            const char *t = title_j->valuestring;
+            // titles we recognize (in priority order):
+            //   "思考中" → THINKING   "已听到" → HEARD
+            //   "回复"   → SPEAKING   "请讲"   → LISTENING
+            //   "继续吗" → LISTENING
+            //   anything else → leave state untouched
+            if      (strstr(t, "\xe6\x80\x9d\xe8\x80\x83")) lcd_set_state(LCD_STATE_THINKING);
+            else if (strstr(t, "\xe5\xb7\xb2\xe5\x90\xac")) lcd_set_state(LCD_STATE_HEARD);
+            else if (strstr(t, "\xe5\x9b\x9e\xe5\xa4\x8d")) lcd_set_state(LCD_STATE_SPEAKING);
+            else if (strstr(t, "\xe8\xaf\xb7\xe8\xae\xb2") ||
+                     strstr(t, "\xe7\xbb\xa7\xe7\xbb\xad")) lcd_set_state(LCD_STATE_LISTENING);
+        }
+        send_res_ok(rpc_id, nullptr);
     } else if (strcmp(method, "ping") == 0) {
         send_res_ok(rpc_id, nullptr);
     } else {
-        // Unknown methods are common in Phase 3 (tts_start, show_text, set_led
-        // etc.) — ack-with-err so the bridge doesn't hang.
+        // set_led / motion / display.image / wake_resume etc. — ack-with-err
+        // so the bridge doesn't hang waiting for a response.
         send_res_err(rpc_id, "not_implemented", method);
     }
 }
@@ -139,7 +158,8 @@ void on_text(const char *data, size_t len) {
         const char *t = t_j->valuestring;
         if (strcmp(t, "hello.ack") == 0) {
             g_hello_acked = true;
-            ESP_LOGI(TAG, "← hello.ack — bridge online");
+            lcd_set_state(LCD_STATE_IDLE);
+            ESP_LOGI(TAG, "← hello.ack — bridge online (LCD=IDLE)");
         } else if (strcmp(t, "req") == 0) {
             handle_req(root);
         } else if (strcmp(t, "ping") == 0) {

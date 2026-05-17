@@ -12,3 +12,6 @@ dependencies:
   # has both chips on the I2C bus at the default addresses.
   espressif/esp_websocket_client: "^1.4"
   espressif/esp_codec_dev: "~1.5.4"
+  # ILI9341/ILI9342C panel driver (CoreS3 uses 9342C; the 9341 driver
+  # speaks the same SPI command set).
+  espressif/esp_lcd_ili9341: "~1.2"

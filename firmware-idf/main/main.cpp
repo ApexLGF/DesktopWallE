@@ -37,6 +37,7 @@
 #include "pmu.h"
 #include "wifi_sta.h"
 #include "bridge_ws.h"
+#include "lcd.h"
 
 // Re-use the Arduino firmware's config so SSID / bridge host live in
 // one place. (gitignored)
@@ -139,19 +140,29 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "mic_init failed");
         return;
     }
-    heap_dump("post-audio");
+    // ─── LCD ───────────────────────────────────────────────────────────
+    // Bring up the screen before WiFi so the user has visual feedback
+    // ("BOOT" → "WIFI") instead of staring at a black panel for ~3 s.
+    if (lcd_init() != ESP_OK) {
+        ESP_LOGW(TAG, "lcd init failed — continuing headless");
+    }
+    heap_dump("post-audio+lcd");
 
     // ─── WiFi STA ───────────────────────────────────────────────────────
+    lcd_set_state(LCD_STATE_WIFI);
     if (wifi_sta_connect(STACKCHAN_WIFI_SSID, STACKCHAN_WIFI_PASSWORD) != ESP_OK) {
         ESP_LOGE(TAG, "wifi connect failed — continuing offline (VAD-only)");
+        lcd_set_state(LCD_STATE_ERROR);
     }
 
     // ─── ocsc.v2 ws to bridge ───────────────────────────────────────────
+    lcd_set_state(LCD_STATE_BRIDGE);
     if (STACKPROXY_WS_HOST[0]) {
         bridge_ws_start(STACKPROXY_WS_HOST, STACKPROXY_WS_PORT,
                         device_id, boot_count, kFwVersion);
     } else {
         ESP_LOGW(TAG, "STACKPROXY_WS_HOST empty — running offline");
+        lcd_set_state(LCD_STATE_ERROR);
     }
     heap_dump("post-ws");
 
@@ -165,10 +176,12 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "===== mic loop running — talk to the device =====");
 
-    vad_state_t prev    = VAD_SILENCE;
-    int64_t     t0_us   = esp_timer_get_time();
-    int         frames  = 0;
+    vad_state_t prev          = VAD_SILENCE;
+    int64_t     t0_us         = esp_timer_get_time();
+    int         frames        = 0;
     int         heartbeat_period = 1000 / (frame_samps * 1000 / model_sr);   // ≈31 frames
+    bool        prev_streaming = false;
+    int         idle_paint_at  = -1;     // when (in frames) to flip LCD back to IDLE
 
     while (true) {
         int got = mic_read_multi(multi, frame_samps);
@@ -198,8 +211,20 @@ extern "C" void app_main(void) {
             // SPEECH→SILENCE while streaming = end-of-utterance.
             if (prev == VAD_SPEECH && cur == VAD_SILENCE && bridge_ws_mic_streaming()) {
                 bridge_ws_signal_speech_end("vad");
+                lcd_set_state(LCD_STATE_HEARD);
             }
             prev = cur;
+        }
+        // Schedule LCD → IDLE shortly after the mic stream closes so the
+        // user gets a clear "we're done, talk again to wake" cue.
+        bool streaming_now = bridge_ws_mic_streaming();
+        if (prev_streaming && !streaming_now) {
+            idle_paint_at = frames + heartbeat_period * 3;   // ~3 s later
+        }
+        prev_streaming = streaming_now;
+        if (idle_paint_at > 0 && frames >= idle_paint_at) {
+            if (bridge_ws_is_connected()) lcd_set_state(LCD_STATE_IDLE);
+            idle_paint_at = -1;
         }
 
         if ((frames % heartbeat_period) == 0) {

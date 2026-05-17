@@ -4,6 +4,7 @@ idf_component_register(
                  "pmu.cpp"
                  "wifi_sta.cpp"
                  "bridge_ws.cpp"
+                 "lcd.cpp"
     INCLUDE_DIRS "."
     REQUIRES     nvs_flash
                  spiffs
@@ -14,5 +15,7 @@ idf_component_register(
                  esp_driver_gpio
                  esp_driver_i2c
                  esp_driver_i2s
+                 esp_driver_spi
+                 esp_lcd
                  esp-sr
 )
