@@ -42,6 +42,7 @@
 #include "lcd.h"
 #include "speaker.h"
 #include "led.h"
+#include "touch.h"
 
 // Re-use the Arduino firmware's config so SSID / bridge host live in
 // one place. (gitignored)
@@ -70,6 +71,21 @@ void heap_dump(const char *where) {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// Forehead-tap handler. The "interrupt the robot" gesture:
+//   - mid-TTS: cut the speaker immediately so the user can talk;
+//   - any state: emit `evt wake word=tap` so the bridge cancels any
+//     in-flight TTS generation and opens a new turn (same path
+//     WakeNet uses, so the bridge only learns one shape).
+// pad_index is 0..2 or -1 (multi-pad). We don't differentiate yet —
+// any tap means "stop and listen."
+void on_touch_tap(int pad_index) {
+    ESP_LOGI(TAG, "💆 head tap pad=%d — interrupting", pad_index);
+    if (speaker_is_active()) {
+        speaker_stop();
+    }
+    bridge_ws_send_wake_event("tap");
 }
 
 // Pull a stable device_id from MAC + bump a boot_count counter in NVS
@@ -161,6 +177,10 @@ extern "C" void app_main(void) {
     pmu_init(i2c_bus);
     if (led_init(i2c_bus) != ESP_OK) {
         ESP_LOGW(TAG, "led init failed — RGB ring will stay dark");
+    }
+    touch_register_tap_cb(on_touch_tap);
+    if (touch_init(i2c_bus) != ESP_OK) {
+        ESP_LOGW(TAG, "touch init failed — head-tap interrupt disabled");
     }
     vTaskDelay(pdMS_TO_TICKS(100));
     if (mic_init(i2c_bus, kMicSampleRateHz, kMicGainDb) != ESP_OK) {

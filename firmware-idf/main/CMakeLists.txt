@@ -7,6 +7,7 @@ idf_component_register(
                  "lcd.cpp"
                  "speaker.cpp"
                  "led.cpp"
+                 "touch.cpp"
     INCLUDE_DIRS "."
     REQUIRES     nvs_flash
                  spiffs
