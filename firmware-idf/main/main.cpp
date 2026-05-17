@@ -57,8 +57,8 @@ static const char *TAG = "vad_spike";
 namespace {
 
 constexpr uint32_t kMicSampleRateHz = 16000;
-constexpr int      kMicGainDb       = 60;
-constexpr int      kVadChannel      = 0;       // ES7210 2-ch open: slot 0 = primary mic, slot 1 = AEC ref
+constexpr int      kMicGainDb       = 75;      // 2-ch open spreads gain; max preamp brings level back up
+constexpr int      kVadChannel      = 1;       // ES7210 2-ch: peak diagnostics show slot 1 carries the real mic
 constexpr char     kFwVersion[]     = "idf-0.1.0";
 
 void heap_dump(const char *where) {
