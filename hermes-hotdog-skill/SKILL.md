@@ -34,10 +34,13 @@ The Bridge `/rpc` endpoint is a *generic dispatcher*. The device firmware implem
 | `set_led_effect` (alias: `led_effect`) | `{name, r?, g?, b?, speed_ms?}` | Animated effect. `name` ∈ `off`, `solid`, `rainbow`, `breathing`, `pulse`, `scanner`, `wipe`, `sparkle`, `police`, `fire`, `chase`, `theater`, `listening`, `thinking`, `talking`, `recording`. `r/g/b` is the base color where applicable; `speed_ms` overrides the effect's default tick. |
 | `face` (alias: `set_face`, `display_face`) | `{expression, eye_rgb?, mouth_rgb?, bg_rgb?}` | StackChan-style face on the LCD. `expression` ∈ `neutral`, `happy`, `smile`, `love`, `sad`, `angry`, `surprised`, `thinking`, `sleep`, `wink_l`, `wink_r`, `stare`, `dead`, `embarrassed`, `cat`, `speak`/`talking`. Colors are 24-bit packed (e.g. `0x00ff00`). |
 | `show_text` | `{title, text}` | Title-driven LCD state hint (HEARD / THINK / TALK / ASR / IDLE …). For real text rendering, use Bridge `/show_text` (PIL on the Mac mini, ships JPEG). |
-| `volume` | `{pct?}` (0..100) | Speaker volume. Without params → returns current. With `pct` → sets. Returns `{pct}`. |
-| `brightness` | `{pct?}` (0..100) | LCD backlight via AXP2101 DLDO1. Same read/write pattern as `volume`. |
-| `battery` | none | Returns `{voltage_mv, vbus_mv, percent, charging}` from the AXP2101 fuel gauge. |
+| `volume` (alias: `set_volume`, `get_volume`) | `{pct?}` (0..100) | Speaker volume. Without params → returns current. With `pct` → sets. Returns `{pct}`. |
+| `brightness` (alias: `set_brightness`, `get_brightness`) | `{pct?}` (0..100) | LCD backlight via AXP2101 DLDO1. Same read/write pattern as `volume`. |
+| `battery` (alias: `get_battery`) | none | Returns `{voltage_mv, vbus_mv, percent, charging}` from the AXP2101 fuel gauge. |
 | `status` (alias: `get_sensors`) | none | Returns `{uptime_ms, free_heap, free_psram, fw, app, vol, brightness, vbat_mv, charging}`. |
+| `idle` (alias: `set_idle`) | `{enabled?: bool}` | Toggle the "look-around" idle motion (random head moves every 4–9 s, ±450 yaw, 300..600 pitch). Without params → returns current state. Returns `{enabled}`. |
+| `breathing` (alias: `set_breathing`) | `{enabled?: bool}` | Toggle subtle pitch oscillation (±20 sc-units, ~60 ms tick). Cheap "alive" idle effect. Same read/write shape as `idle`. |
+| `head_stop` (alias: `stop`) | none | Disables idle + breathing and re-issues the current goal — terminates any in-flight servo tween. |
 | `reboot` | none | Sends the ack frame then `esp_restart()` — bridge reconnects on the new boot. |
 | `cam_capture` | internal | Don't call directly — Bridge wraps this in `/capture`. Currently disabled (esp_camera lockup on this firmware revision). |
 

@@ -64,6 +64,32 @@ bool servo_is_ready(void);
 // vTaskDelay (typical 0.5–3 s total).
 esp_err_t servo_action(const char *name);
 
+// Read the most recently commanded yaw / pitch (in StackChan units).
+// Both pointers may be NULL. Values reflect the last servo_move()
+// argument — these are setpoints, not measured positions (we never
+// read back from the bus).
+void servo_get_pos(int *x, int *y);
+
+// Enable / disable the periodic "look around" idle motion. When on,
+// an internal task wakes every 4–9 s and issues a small random head
+// move. Yaw range ±450 sc-units, pitch 200..600. Disabled by default
+// so it never fights live agent commands.
+void servo_set_idle(bool enabled);
+bool servo_get_idle(void);
+
+// Enable / disable the subtle "breathing" pitch oscillation. The
+// internal task modulates pitch by ±20 sc-units around the most
+// recent commanded Y at ~60 ms cadence. Cheap and convincing —
+// makes the robot look alive between explicit commands.
+void servo_set_breathing(bool enabled);
+bool servo_get_breathing(void);
+
+// Halt motion. Disables idle + breathing and re-issues the current
+// goal position with default speed, which on Feetech SCS servos
+// terminates any in-flight tween. Does NOT cancel a blocking gesture
+// running on the caller's task (servo_action is synchronous).
+void servo_stop_motion(void);
+
 #ifdef __cplusplus
 }
 #endif

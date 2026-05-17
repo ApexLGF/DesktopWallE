@@ -7,8 +7,11 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 
 static const char *TAG = "servo";
 
@@ -35,6 +38,23 @@ constexpr int Y_HOME_SC_UNITS  = 425;   // matches old fw's home pitch.
 constexpr int SPEED_DEFAULT    = 200;
 
 bool g_ready = false;
+
+// Motion state — tracked by servo_move() so the idle / breathing
+// controllers can modulate around the most recent commanded pose
+// without snapping back to home each tick.
+int           g_cur_x        = 0;
+int           g_cur_y        = Y_HOME_SC_UNITS;
+volatile bool g_idle_on      = false;
+volatile bool g_breath_on    = false;
+TaskHandle_t  g_motion_task  = nullptr;
+
+constexpr uint32_t IDLE_MIN_INTERVAL_MS = 4000;
+constexpr uint32_t IDLE_MAX_INTERVAL_MS = 9000;
+constexpr int      IDLE_YAW_RANGE       = 450;   // ±450 sc-units
+constexpr int      IDLE_PITCH_LOW       = 300;
+constexpr int      IDLE_PITCH_HIGH      = 600;
+constexpr int      BREATH_PITCH_AMP     = 20;    // ±20 sc-units
+constexpr uint32_t BREATH_TICK_MS       = 60;
 
 uint8_t checksum(const uint8_t *buf, size_t len) {
     uint32_t sum = 0;
@@ -153,6 +173,8 @@ void servo_move(int x, int y, int speed) {
     uint16_t pitch_raw = pitch_to_raw(y);
     servo_write_pos(1, yaw_raw,   0, (uint16_t)s);
     servo_write_pos(2, pitch_raw, 0, (uint16_t)s);
+    g_cur_x = clamp_int(x, -1280, 1280);
+    g_cur_y = clamp_int(y,     0,  850);
 }
 
 void servo_home(void) {
@@ -160,6 +182,97 @@ void servo_home(void) {
 }
 
 bool servo_is_ready(void) { return g_ready; }
+
+void servo_get_pos(int *x, int *y) {
+    if (x) *x = g_cur_x;
+    if (y) *y = g_cur_y;
+}
+
+namespace {
+
+// Motion controller task: ticks every BREATH_TICK_MS, runs both the
+// breathing oscillation and the idle "look around" scheduler off the
+// same clock. Keeping them in one task avoids servo bus contention
+// (each write is ~120 µs on the wire but we still want to serialize).
+void motion_task(void *arg) {
+    (void)arg;
+    uint32_t next_idle_ms = 0;
+    uint32_t breath_phase = 0;     // 0..99
+    int      breath_baseY = -1;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(BREATH_TICK_MS));
+
+        const uint32_t now = (uint32_t)(esp_log_timestamp());
+
+        // ── Idle "look around" ────────────────────────────────────────
+        if (g_idle_on) {
+            if (next_idle_ms == 0) {
+                next_idle_ms = now + IDLE_MIN_INTERVAL_MS +
+                               (esp_random() % (IDLE_MAX_INTERVAL_MS - IDLE_MIN_INTERVAL_MS));
+            } else if ((int32_t)(now - next_idle_ms) >= 0) {
+                next_idle_ms = now + IDLE_MIN_INTERVAL_MS +
+                               (esp_random() % (IDLE_MAX_INTERVAL_MS - IDLE_MIN_INTERVAL_MS));
+                int dx = (int)(esp_random() % (IDLE_YAW_RANGE * 2 + 1)) - IDLE_YAW_RANGE;
+                int dy = IDLE_PITCH_LOW +
+                         (int)(esp_random() % (IDLE_PITCH_HIGH - IDLE_PITCH_LOW + 1));
+                servo_move(dx, dy, 350);
+                // Reset breathing base to track the new pose.
+                breath_baseY = g_cur_y;
+            }
+        } else {
+            next_idle_ms = 0;
+        }
+
+        // ── Breathing pitch oscillation ───────────────────────────────
+        if (g_breath_on) {
+            if (breath_baseY < 0) breath_baseY = g_cur_y;
+            breath_phase = (breath_phase + 1) % 100;
+            float  t  = (breath_phase / 100.0f) * 6.2831853f;
+            int    dy = (int)(sinf(t) * BREATH_PITCH_AMP);
+            int    target_y = clamp_int(breath_baseY + dy, 0, 850);
+            // Direct write_pos so we don't overwrite g_cur_y — the
+            // user's commanded baseline stays put, only the wire output
+            // wobbles.
+            uint16_t pitch_raw = pitch_to_raw(target_y);
+            servo_write_pos(2, pitch_raw, 0, (uint16_t)200);
+        } else {
+            breath_baseY = -1;
+        }
+    }
+}
+
+void ensure_motion_task() {
+    if (g_motion_task) return;
+    xTaskCreatePinnedToCore(motion_task, "servo_motion", 3072, nullptr,
+                            tskIDLE_PRIORITY + 1, &g_motion_task, 0);
+}
+
+}  // namespace
+
+void servo_set_idle(bool enabled) {
+    g_idle_on = enabled;
+    if (enabled) ensure_motion_task();
+}
+bool servo_get_idle(void) { return g_idle_on; }
+
+void servo_set_breathing(bool enabled) {
+    g_breath_on = enabled;
+    if (enabled) ensure_motion_task();
+}
+bool servo_get_breathing(void) { return g_breath_on; }
+
+void servo_stop_motion(void) {
+    g_idle_on = false;
+    g_breath_on = false;
+    if (!g_ready) return;
+    // Re-issue current commanded pose at default speed — interrupts
+    // any in-flight tween and ensures bus reaches a known state.
+    uint16_t yaw_raw   = yaw_to_raw(g_cur_x);
+    uint16_t pitch_raw = pitch_to_raw(g_cur_y);
+    servo_write_pos(1, yaw_raw,   0, SPEED_DEFAULT);
+    servo_write_pos(2, pitch_raw, 0, SPEED_DEFAULT);
+}
 
 // ── Gesture sequences ────────────────────────────────────────────────────
 // All movements are in StackChan units (10 = 1°). Speed 200 ≈ natural

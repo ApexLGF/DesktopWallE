@@ -341,6 +341,37 @@ void handle_req(cJSON *root) {
         } else {
             send_res_err(rpc_id, "action_failed", esp_err_to_name(err));
         }
+    } else if (strcmp(method, "idle") == 0 ||
+               strcmp(method, "set_idle") == 0) {
+        // Toggle the "look-around" idle motion. params {enabled: bool}.
+        // Read-only when params absent. Returns {enabled}.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "enabled") : nullptr;
+        if (cJSON_IsBool(e_j) || cJSON_IsNumber(e_j)) {
+            bool en = cJSON_IsBool(e_j) ? cJSON_IsTrue(e_j) : (e_j->valueint != 0);
+            servo_set_idle(en);
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddBoolToObject(d, "enabled", servo_get_idle());
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "breathing") == 0 ||
+               strcmp(method, "set_breathing") == 0) {
+        // Toggle the breathing pitch oscillation. Same shape as `idle`.
+        const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
+        const cJSON *e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "enabled") : nullptr;
+        if (cJSON_IsBool(e_j) || cJSON_IsNumber(e_j)) {
+            bool en = cJSON_IsBool(e_j) ? cJSON_IsTrue(e_j) : (e_j->valueint != 0);
+            servo_set_breathing(en);
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddBoolToObject(d, "enabled", servo_get_breathing());
+        send_res_ok(rpc_id, d);
+    } else if (strcmp(method, "head_stop") == 0 ||
+               strcmp(method, "stop") == 0) {
+        // Halt idle / breathing and re-issue current goal to interrupt
+        // any in-flight servo tween.
+        servo_stop_motion();
+        send_res_ok(rpc_id, nullptr);
     } else if (strcmp(method, "torque") == 0) {
         const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
         const cJSON *e_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "enabled") : nullptr;
@@ -349,7 +380,9 @@ void handle_req(cJSON *root) {
         servo_torque(1, en);
         servo_torque(2, en);
         send_res_ok(rpc_id, nullptr);
-    } else if (strcmp(method, "volume") == 0) {
+    } else if (strcmp(method, "volume") == 0 ||
+               strcmp(method, "set_volume") == 0 ||
+               strcmp(method, "get_volume") == 0) {
         // Speaker volume. Read: params absent → return current.
         // Write: params {pct: 0..100}. Returns {pct} in both cases.
         const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
@@ -364,7 +397,9 @@ void handle_req(cJSON *root) {
         cJSON *d = cJSON_CreateObject();
         cJSON_AddNumberToObject(d, "pct", speaker_get_volume());
         send_res_ok(rpc_id, d);
-    } else if (strcmp(method, "brightness") == 0) {
+    } else if (strcmp(method, "brightness") == 0 ||
+               strcmp(method, "set_brightness") == 0 ||
+               strcmp(method, "get_brightness") == 0) {
         // LCD backlight via AXP2101 DLDO1. params {pct: 0..100}.
         const cJSON *p_j = cJSON_GetObjectItemCaseSensitive(root, "p");
         const cJSON *pct_j = p_j ? cJSON_GetObjectItemCaseSensitive(p_j, "pct") : nullptr;
@@ -378,7 +413,8 @@ void handle_req(cJSON *root) {
         cJSON *d = cJSON_CreateObject();
         cJSON_AddNumberToObject(d, "pct", pmu_get_backlight());
         send_res_ok(rpc_id, d);
-    } else if (strcmp(method, "battery") == 0) {
+    } else if (strcmp(method, "battery") == 0 ||
+               strcmp(method, "get_battery") == 0) {
         int vbat = 0, vbus = 0, soc = -1;
         bool chg = false;
         esp_err_t err = pmu_battery_read(&vbat, &soc, &chg, &vbus);
