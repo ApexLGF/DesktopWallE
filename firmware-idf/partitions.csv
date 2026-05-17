@@ -1,0 +1,8 @@
+# Name,    Type, SubType, Offset,   Size,    Flags
+nvs,        data, nvs,     ,         0x6000,
+phy_init,   data, phy,     ,         0x1000,
+factory,    app,  factory, ,         0x300000,
+# esp-sr looks up partition by label="model". We give it ~5 MB which is
+# enough for vadnet1_medium + a small wakenet. (CoreS3 has 16 MB flash.)
+model,      data, spiffs,  ,         0x500000,
+storage,    data, spiffs,  ,         0x100000,

@@ -1,0 +1,42 @@
+# DesktopWallE IDF spike — sane defaults for M5 CoreS3 + esp-sr VAD.
+# Anything not set here uses IDF v5.5.4 defaults.
+
+# ─── Target / flash ──────────────────────────────────────────────────────
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ─── Partition table ─────────────────────────────────────────────────────
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# ─── PSRAM (CoreS3 = 8 MB *quad* PSRAM — APS6408L; NOT octal despite the
+# datasheet description in some places. Confirmed by m5stack's own
+# firmware/sdkconfig.defaults: they leave SPIRAM_MODE on default=quad.
+# Setting MODE_OCT here makes the bootloader fail with "PSRAM chip is not
+# connected, or wrong PSRAM line mode" → abort loop.) ────────────────────
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
+# ─── FreeRTOS — leave dual-core default ─────────────────────────────────
+CONFIG_FREERTOS_HZ=100
+
+# ─── esp-sr — VADNet only, no wakenet / multinet for the spike ──────────
+# Real config names per esp-sr Kconfig.projbuild:
+#   choice MODEL_DATA_PATH       default MODEL_IN_FLASH         (we want this)
+#   choice AFE_INTERFACE_SEL     default AFE_INTERFACE_V1
+#   choice SR_VADN_MODEL_LOAD    default SR_VADN_WEBRTC         (we override to neural)
+#   wake words / multinet are individual bools; leaving them unset == disabled
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_VADN_VADNET1_MEDIUM=y
+
+# ─── Logging ─────────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y

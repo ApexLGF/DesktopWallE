@@ -1,0 +1,9 @@
+## DesktopWallE IDF spike component manifest.
+##
+## esp-sr is provided as a local EXTRA_COMPONENT_DIR by the root
+## CMakeLists.txt (see ESP_SR_PATH override). Only the small registry
+## components are managed here.
+dependencies:
+  idf: ">=5.5,<5.6"
+  espressif/esp-dsp: "^1.8"
+  espressif/dl_fft: ">=0.2"

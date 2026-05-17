@@ -7,6 +7,13 @@ build/
 *.elf
 *.bin
 
+# ESP-IDF
+firmware-idf/build/
+firmware-idf/sdkconfig
+firmware-idf/sdkconfig.old
+firmware-idf/managed_components/
+firmware-idf/dependencies.lock
+
 # Local device config (per-checkout secrets — Wi-Fi password, auth token)
 include/config.h
 
