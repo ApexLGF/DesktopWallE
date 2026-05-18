@@ -388,8 +388,19 @@ async def ws_handler(ws, hub: Hub) -> None:
                 await handle_binary(hub, device, raw)
             else:
                 await handle_text(hub, device, raw)
-    except websockets.ConnectionClosed:
-        pass
+    except websockets.ConnectionClosed as e:
+        # Log close code + reason so we can tell why the connection
+        # dropped (NAT eviction, ping timeout, device-side close,
+        # transport_poll_write failure, etc.). Without this the
+        # `[hub] unregistered` line in the finally block is the only
+        # evidence and there's no clue WHY.
+        dev_id = device.device_id if device else "?"
+        rcvd = getattr(e, "rcvd", None)
+        sent = getattr(e, "sent", None)
+        log.warning("[ws] %s closed: rcvd=%r sent=%r", dev_id, rcvd, sent)
+    except Exception:
+        dev_id = device.device_id if device else "?"
+        log.exception("[ws] %s handler crashed", dev_id)
     finally:
         if device is not None:
             await hub.unregister(device)
@@ -2326,6 +2337,12 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Bump the websockets server logger to DEBUG so close-frame
+    # exchanges, pings, and protocol errors show up in bridge.log.
+    # This is what we need to diagnose mysterious "hub unregistered"
+    # events that fire mid-TTS — the close-code/reason gets logged
+    # by the lib only at DEBUG level.
+    logging.getLogger("websockets.server").setLevel(logging.DEBUG)
     _effective_speaker = cfg.tts.speaker or doubao_tts_unidirectional.DEFAULT_SPEAKER
     log.info("config: doubao=ok ws=%s:%d http=%s:%d tts.speaker=%s source=%s",
              args.ws_host, args.ws_port, args.http_host, args.http_port,

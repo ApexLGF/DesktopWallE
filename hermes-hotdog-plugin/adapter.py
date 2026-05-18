@@ -262,6 +262,25 @@ class HotdogAdapter(BasePlatformAdapter):
         # Strip simple markdown so TTS doesn't read "**bold**" literally.
         clean = self._strip_markdown(content.strip())
 
+        # Hard cap reply length. Empirically the device's WS occasionally
+        # drops mid-utterance after >20 s of continuous opus playback —
+        # the audio task starves the WS keepalive task on the ESP32-S3
+        # and the bridge sees a stray close. Cap at ~300 chars (≈ 18 s
+        # of Mandarin at ~17 chars/s) so we stay well inside the safe
+        # zone. The platform_hint already tells the agent to be terse;
+        # this is the belt to the suspenders.
+        MAX_TTS_CHARS = 300
+        if len(clean) > MAX_TTS_CHARS:
+            # Try to cut at the last sentence-ending punctuation within
+            # the budget so the reply doesn't get sliced mid-word.
+            head = clean[:MAX_TTS_CHARS]
+            cut = max(head.rfind(p) for p in ("。", "！", "？", "!", "?", "."))
+            if cut > MAX_TTS_CHARS // 2:
+                head = clean[: cut + 1]
+            logger.info("Hotdog: truncating reply %d → %d chars",
+                        len(clean), len(head))
+            clean = head
+
         # `/say` queues the reply into the bridge's TTS pipeline and
         # returns immediately when `nonblocking` is set. The bridge's
         # voice_loop is what owns the conversation rhythm: after the
@@ -425,11 +444,18 @@ def register(ctx) -> None:
         # to reach for bash / curl / sc scripts, because those used to
         # be the path before the channel migration.
         platform_hint=(
-            "你正在通过桌面机器人「热狗」(StackChan) 与用户对话。"
-            "你给出的纯文本回复会被服务端自动合成为中文语音并通过设备小喇叭"
-            "朗读给用户听 —— 所以请用自然、简短的口语化中文回答，"
-            "不要使用 markdown、代码块或长列表；回复尽量控制在 80 字以内，"
-            "需要详细说明就分多句说。\n"
+            "你正在通过桌面机器人「热狗」(StackChan) 与用户对话。这是一个"
+            "纯语音通道：你给出的文本会被服务端自动合成为中文语音，通过设备"
+            "小喇叭一次性朗读给用户听。\n"
+            "**必须遵守的回复规则**：\n"
+            "1. 回复总长度严格控制在 100 个汉字以内（≈6 秒语音），决不超过 "
+            "200 字。用户的耐心是有限的，长篇大论会让对话像广播员念稿。\n"
+            "2. 不使用 markdown、代码块、bullet list、表格、表情符号"
+            "（emoji 在 TTS 里只会被忽略）；用自然的口语句子。\n"
+            "3. 不要说 \"我来介绍一下…\" 这种开场白，直接给答案；\n"
+            "4. 用户问 \"介绍一下你自己\" 这类开放问题时，回一句 5-15 字的"
+            "简介就够，不要罗列功能列表。\n"
+            "5. 信息量大时拆成多轮：先答最关键的一句，留给用户追问的空间。\n\n"
             "需要控制机器人硬件时，调用本平台已注册的工具："
             "hotdog_face（表情）、hotdog_action（点头/摇头/跳舞等动作）、"
             "hotdog_led（灯环）、hotdog_move（精确头位）、"
