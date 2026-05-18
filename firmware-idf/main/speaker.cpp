@@ -207,9 +207,23 @@ void speaker_task(void *arg) {
         }
         if (c.end) {
             prebuffering = false;
-            close_after_playback();
             g_active = false;
+            // The last esp_codec_dev_write returned the moment the DMA
+            // descriptor accepted our bytes, but the I2S DMA still has
+            // up to ~240 ms of audio queued (dma_desc_num=8 *
+            // dma_frame_num=480 / 16 kHz, see mic.cpp). If we send
+            // tts.done immediately and close the codec, the bridge
+            // opens the follow-up mic over the bot's own tail audio
+            // and SenseVoice ASRs it back as a "user turn" — a
+            // feedback loop where the device chats with itself.
+            //
+            // Hold here while the DMA drains naturally (codec stays
+            // open so playout continues), then report tts.done, then
+            // close. 300 ms covers the 240 ms DMA cushion plus a
+            // small physical cone-decay / room-reverb margin.
+            vTaskDelay(pdMS_TO_TICKS(300));
             bridge_ws_send_tts_done(c.sid);
+            close_after_playback();
             // Settle the LCD back to IDLE if the bridge has nothing
             // queued. We learned the hard way that 2 s is too aggressive
             // — Hermes-driven bridges can take 3-4 s before sending the
