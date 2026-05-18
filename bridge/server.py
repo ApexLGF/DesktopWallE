@@ -230,6 +230,15 @@ class Device:
     # spoke via `sc say`, the bridge MUST NOT speak the stdout again
     # (double-speak: same content played twice on the device).
     say_invoked_this_turn: bool = False
+    # Hermes session id so consecutive voice turns share context. Set on
+    # the first _ask_hermes call (parsed from `hermes chat -Q -q ...`
+    # output), then passed back via `-r <id>` on subsequent turns until
+    # `hermes_session_idle_since` exceeds HERMES_SESSION_TTL_S — at
+    # which point we drop it and start a fresh session. SQLite still
+    # holds the old session; the user can browse / resume via
+    # `hermes sessions`.
+    hermes_session_id: str = ""
+    hermes_session_idle_since: float = 0.0
 
     def next_sid(self) -> int:
         sid = self.sid_seq
@@ -815,6 +824,11 @@ VOICE_SILENCE_S    = 1.8       # seconds without new partial → finalize
 ASR_END_WINDOW_MS  = 2000      # Doubao's own server-side detector (we mostly ignore its result)
 HERMES_TIMEOUT_S   = 90.0
 HERMES_SKILLS      = "hotdog"
+# How long a per-device Hermes session stays "live" between voice turns.
+# After this many seconds of no _ask_hermes call the next turn drops the
+# stored session_id and starts fresh — keeps the context relevant
+# without bloating the prompt with stale history.
+HERMES_SESSION_TTL_S = 10 * 60.0
 # Per-device dialog history cap fed back to Doubao as `context`. Volcengine
 # limit is ~800 tokens / 20 turns; 24 entries (≈12 round trips) is well inside
 # and matches the rule-of-thumb "remember the last few minutes of chat".
@@ -946,7 +960,7 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                                        "text": transcript}, timeout=2.0)
             ticker_task = asyncio.create_task(hermes_ticker())
             try:
-                reply = await _ask_hermes(transcript)
+                reply = await _ask_hermes(transcript, device)
             finally:
                 hermes_done.set()
                 with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -1333,11 +1347,33 @@ def _strip_markdown_for_tts(text: str) -> str:
     return out.strip().strip("\uff0c,")
 
 
-async def _ask_hermes(text: str) -> str:
-    """One-shot Hermes invocation. The bridge runs on the same host as Hermes
-    (the Mac mini), so we spawn `hermes -z` locally."""
-    cmd = ["hermes", "-z", text, "--skills", HERMES_SKILLS, "--yolo"]
-    log.info("[hermes] -> %s", " ".join(cmd[:3]))
+async def _ask_hermes(text: str, device: Device | None = None) -> str:
+    """Invoke Hermes with multi-turn session continuity per device.
+
+    Uses `hermes chat -Q -q <text>` so stdout starts with a clean
+    `session_id: <id>` header followed by the reply. The first turn for
+    a given device captures and stores that id; later turns within the
+    HERMES_SESSION_TTL_S window pass `-r <id>` so Hermes resumes the
+    same conversation. After the TTL expires the stored id is dropped
+    and the next call opens a fresh session.
+
+    `device` is optional — callers that don't need continuity (debug
+    paths, /perform cues) can pass None and we'll do a one-shot.
+    """
+    cmd = ["hermes", "chat", "-Q", "-q", text,
+           "--skills", HERMES_SKILLS, "--yolo"]
+    resume_id = ""
+    if device is not None and device.hermes_session_id:
+        idle = time.time() - device.hermes_session_idle_since
+        if idle <= HERMES_SESSION_TTL_S:
+            resume_id = device.hermes_session_id
+            cmd.extend(["-r", resume_id])
+        else:
+            log.info("[hermes] session %s idle %.0fs > TTL, starting fresh",
+                     device.hermes_session_id, idle)
+            device.hermes_session_id = ""
+    log.info("[hermes] -> chat -q %s%s", text[:60],
+             f" [resume {resume_id}]" if resume_id else " [new session]")
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1356,7 +1392,37 @@ async def _ask_hermes(text: str) -> str:
     if proc.returncode != 0:
         log.warning("[hermes] exit=%d stderr=%s",
                     proc.returncode, (err or b"").decode(errors="replace")[:200])
-    return (out or b"").decode("utf-8", errors="replace").strip()
+
+    reply_raw = (out or b"").decode("utf-8", errors="replace").strip()
+    err_text = (err or b"").decode("utf-8", errors="replace")
+    # When `-r <id>` resumes a session Hermes prints a "↻ Resumed
+    # session …" banner to STDOUT ahead of the reply (different from
+    # session_id on stderr). Strip those leading banner lines so the
+    # device doesn't speak them.
+    out_lines = reply_raw.splitlines()
+    while out_lines:
+        first = out_lines[0].strip()
+        if first.startswith("↻ Resumed session") or first.startswith("Resumed session "):
+            out_lines.pop(0)
+            continue
+        break
+    reply = "\n".join(out_lines).strip()
+    # `hermes chat -Q` writes its banner to STDERR (`session_id: <id>`
+    # is on a line by itself there); stdout is the pure agent reply.
+    if device is not None:
+        for line in err_text.splitlines():
+            s = line.strip()
+            if s.startswith("session_id:"):
+                sid = s.split(":", 1)[1].strip()
+                if sid:
+                    device.hermes_session_id = sid
+                    device.hermes_session_idle_since = time.time()
+                    break
+        # Bump idle even on parse failure so a slow turn (where session
+        # capture happened previously) doesn't TTL out mid-conversation.
+        if device.hermes_session_id:
+            device.hermes_session_idle_since = time.time()
+    return reply
 
 
 async def http_voice(req: web.Request) -> web.Response:
