@@ -626,19 +626,33 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     // margin.
     cfg.task_stack                = 8192;
     cfg.task_prio                 = 5;
-    // Don't auto-disconnect on missed pong — wifi RSSI here is -70 dB
-    // and we'd rather miss a heartbeat than tear the audio stream.
-    // WS keepalive: send a ping frame every 30 s so the path's NAT /
-    // session table sees traffic and doesn't evict the connection. WS pings
-    // are 2-byte control frames; cheap. Without this the link sat silent
-    // for minutes between turns and got dropped by router/AP NAT every
-    // 3-5 minutes (matched typical NAT TCP idle timeouts).
+    // Two-layer dead-socket detection so a bridge process restart or
+    // WiFi pull doesn't leave the device sitting on a zombie WS
+    // connection (the bridge-restart case bit us during channel-mode
+    // development — the device thought it was still connected for
+    // minutes after the bridge daemon exited, until something tried
+    // to write).
     //
-    // disable_pingpong_discon=true: ping is for *keepalive*, not health
-    // check. We don't want a transient pong loss to kill an otherwise
-    // healthy connection — if the WS is truly dead, transport_poll_write
-    // failures or TCP RST will surface it within a frame or two.
-    cfg.disable_pingpong_discon   = true;
+    // Layer 1 — TCP keep-alive at the socket level. Fires SO_KEEPALIVE
+    // probes after `keep_alive_idle` seconds of zero traffic. With
+    // 10 + 5×3 = 25 s worst-case detection, a hard-broken socket
+    // (bridge crashed, WiFi roam) gets torn down well before the user
+    // notices, and the WS lib's auto-reconnect (reconnect_timeout_ms=
+    // 1500) brings us back online ~27 s after the bridge died.
+    cfg.keep_alive_enable         = true;
+    cfg.keep_alive_idle           = 10;
+    cfg.keep_alive_interval       = 5;
+    cfg.keep_alive_count          = 3;
+    //
+    // Layer 2 — WS application-level ping every 30 s. NAT / AP idle
+    // timers in the path get traffic to keep the conduit alive.
+    // We DO leave pingpong-disconnect enabled now (different from the
+    // 2026-04 setting) but with a long 60 s pingpong_timeout — that
+    // tolerates a single missed pong on flaky WiFi without killing
+    // the connection, while still cutting cleanly if pongs stop
+    // entirely (which the TCP keep-alive should already catch faster).
+    cfg.disable_pingpong_discon   = false;
+    cfg.pingpong_timeout_sec      = 60;
     cfg.ping_interval_sec         = 30;
     g_client = esp_websocket_client_init(&cfg);
     if (!g_client) {
