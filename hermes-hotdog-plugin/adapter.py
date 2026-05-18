@@ -391,7 +391,13 @@ def is_connected(adapter: HotdogAdapter) -> bool:
 
 
 def register(ctx) -> None:
-    """Plugin entry point: called by Hermes' plugin discovery."""
+    """Plugin entry point: called by Hermes' plugin discovery.
+
+    Registers both the platform adapter (inbox + send) and the
+    hotdog_* tool family that the agent uses to drive the robot
+    hardware. The two together turn StackChan into a clean Hermes
+    channel — text in/out via the adapter, hardware actions via tools.
+    """
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Hotdog",
@@ -414,14 +420,33 @@ def register(ctx) -> None:
         cron_deliver_env_var="HOTDOG_HOME_CHANNEL",
         # Hint to the LLM about how its replies will be consumed: spoken
         # aloud through a small speaker, so plain conversational Chinese
-        # works best. Skill-tool calls (move_head / set_led / etc.) remain
-        # available via the `hotdog` skill the device exposes.
+        # works best. The hardware-control surface is a set of native
+        # tools (registered just below) — explicitly tell the agent NOT
+        # to reach for bash / curl / sc scripts, because those used to
+        # be the path before the channel migration.
         platform_hint=(
-            "你正在通过桌面机器人「热狗」与用户对话。回复会被合成成中文语音"
-            "通过小喇叭朗读出来，所以请用自然简短的口语化中文回答，不要"
-            "使用 markdown、代码块或长列表。回复总长度尽量在 80 字以内；"
-            "需要详细说明时分多句话说。"
-            "想让机器人做表情、动作、亮 LED、显示图片可以调用 hotdog skill"
-            "里的对应工具（不要再调 /say 端点，文字回复会自动朗读）。"
+            "你正在通过桌面机器人「热狗」(StackChan) 与用户对话。"
+            "你给出的纯文本回复会被服务端自动合成为中文语音并通过设备小喇叭"
+            "朗读给用户听 —— 所以请用自然、简短的口语化中文回答，"
+            "不要使用 markdown、代码块或长列表；回复尽量控制在 80 字以内，"
+            "需要详细说明就分多句说。\n"
+            "需要控制机器人硬件时，调用本平台已注册的工具："
+            "hotdog_face（表情）、hotdog_action（点头/摇头/跳舞等动作）、"
+            "hotdog_led（灯环）、hotdog_move（精确头位）、"
+            "hotdog_capture（拍照看一眼）、hotdog_show（屏幕显示图/文）、"
+            "hotdog_status（电量/温度等设备状态）。"
+            "禁止使用 bash / terminal / curl 调任何 HTTP 接口去驱动设备；"
+            "上面这套工具是唯一的硬件入口。"
         ),
     )
+
+    # Native platform tools — agent calls these directly, no skill / bash
+    # / curl needed. The tool handlers HTTP-call the bridge daemon on
+    # this same host (the localhost call is an adapter implementation
+    # detail; the agent never sees the bridge URL). Relative import:
+    # the gateway loads this module as `hermes_plugins.platforms__hotdog.
+    # adapter`, so `from . import tools` resolves to the sibling
+    # `tools.py` in the same plugin directory.
+    from . import tools as hotdog_tools  # type: ignore
+    bridge_url = os.environ.get("HOTDOG_BRIDGE_URL", DEFAULT_BRIDGE_URL)
+    hotdog_tools.register_all(ctx, bridge_url=bridge_url)
