@@ -1732,14 +1732,20 @@ async def _fire_motion(hub: Hub, device: Device, name: str) -> None:
         await hub.rpc(device, "do_action", {"name": name}, timeout=2.0)
 
 
-async def _play_tts_background(device: Device, text: str, *,
+async def _play_tts_background(hub: "Hub", device: Device, text: str, *,
                                sr: int, appid: str, token: str,
                                speaker: str, speech_rate: float,
                                loudness_rate: float) -> None:
     """Nonblocking-mode TTS: stream Doubao chunks to the device in the
     background so http_say can return immediately. voice_loop is the
     one that waits for tts_done_evt before re-opening the mic.
+
+    Registers ourselves as ``device.stream_task`` so a head-tap /
+    wake-word interrupt (handled in handle_event:wake) can cancel
+    streaming mid-utterance — without this hook, an 8 s reply keeps
+    playing for 8 s after the user already tapped to interrupt.
     """
+    device.stream_task = asyncio.current_task()
     tts_iter = doubao_tts_unidirectional.synthesize_stream(
         text,
         app_key=appid, access_key=token,
@@ -1752,9 +1758,21 @@ async def _play_tts_background(device: Device, text: str, *,
     )
     try:
         await stream_pcm_async(device, tts_iter, sr)
+    except asyncio.CancelledError:
+        log.info("[say-bg] %s streaming cancelled (tap/wake interrupt)",
+                 device.device_id)
+        # tts_stop RPC drains the device's speaker queue so the tail
+        # already in DMA gets cut sooner. Fire-and-forget — the new
+        # voice_loop is already starting LISTEN by the time we get here.
+        asyncio.create_task(_safe_tts_stop(hub, device))
+        raise
     except Exception:
         log.exception("[say-bg] %s streaming TTS failed", device.device_id)
     finally:
+        # Clear our slot only if we still hold it (a later /say may have
+        # already overwritten it, in which case it owns the cleanup).
+        if device.stream_task is asyncio.current_task():
+            device.stream_task = None
         with contextlib.suppress(Exception):
             await tts_iter.aclose()
 
@@ -1807,7 +1825,7 @@ async def http_say(req: web.Request) -> web.Response:
         speaker = (body.get("speaker") or tts_cfg.speaker
                    or doubao_tts_unidirectional.DEFAULT_SPEAKER)
         asyncio.create_task(_play_tts_background(
-            device, text, sr=sr, appid=appid, token=token,
+            hub, device, text, sr=sr, appid=appid, token=token,
             speaker=speaker, speech_rate=tts_cfg.speech_rate,
             loudness_rate=tts_cfg.loudness_rate))
         # Rough estimate: ~17 chars/s of Chinese audio so the caller
