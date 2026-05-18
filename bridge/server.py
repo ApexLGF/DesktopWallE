@@ -244,6 +244,12 @@ class Device:
     inbox_pending: bool = False
     inbox_ticker_task: Any = None
     inbox_t0: float = 0.0
+    # Set by http_say the moment a reply lands; voice_loop awaits this
+    # to break out of the thinking phase. Decoupled from tts_done_evt
+    # (the speaker-drained signal) — adapter-initiated /say in
+    # nonblocking mode kicks off TTS in the background, so reply lands
+    # well before TTS finishes playing.
+    reply_landed_evt: asyncio.Event = field(default_factory=asyncio.Event)
 
     def next_sid(self) -> int:
         sid = self.sid_seq
@@ -850,6 +856,10 @@ HERMES_INBOX_URL = os.environ.get("BRIDGE_HERMES_INBOX_URL",
 # This caps the "思考中…" screen — if no /say lands by then we show an
 # error and let the LCD auto-idle take over.
 HERMES_INBOX_REPLY_TIMEOUT_S = 60.0
+# Maximum wait for the device's `tts.done` WS event after a /say
+# arrives. Doubao Chinese TTS runs ~17 chars/s so this comfortably
+# covers a ~5 min monologue; in practice we'll exit much sooner.
+HERMES_INBOX_TTS_TIMEOUT_S = 300.0
 # Per-device dialog history cap fed back to Doubao as `context`. Volcengine
 # limit is ~800 tokens / 20 turns; 24 entries (≈12 round trips) is well inside
 # and matches the rule-of-thumb "remember the last few minutes of chat".
@@ -962,33 +972,59 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                               {"title": "已听到 ✓", "text": transcript},
                               timeout=2.0)
 
-            # Phase 3b — channel mode: hand off to the HotdogAdapter.
-            # The adapter runs the agent in-process, calls back to
-            # `/say` with the reply, and arms its own follow-up
-            # listener. voice_loop's job ends here; the bridge's only
-            # remaining work this turn is to keep `思考中…` on screen
-            # until /say lands (see _inbox_thinking_ticker).
+            # Phase 3b — channel mode: hand the transcript off to the
+            # HotdogAdapter and wait *here* for the reply + speaker
+            # drain. voice_loop is the long-running per-device session
+            # manager: after TTS plays, we loop back to capture the
+            # next user turn (follow-up mic) without spinning up a
+            # fresh voice_loop. Idle silence in the follow-up window
+            # is what ends the conversation.
             if USE_HERMES_INBOX:
                 device.inbox_pending = True
                 device.inbox_t0 = time.time()
+                device.reply_landed_evt.clear()
+                device.tts_done_evt.clear()
                 ok = await _post_inbox(device, transcript)
                 if not ok:
                     # Adapter unreachable — fall through to legacy
-                    # subprocess so the user still gets a reply (echo
-                    # mode is better than total silence).
+                    # subprocess so the user still gets a reply.
                     device.inbox_pending = False
                     log.warning("[voice] %s inbox unreachable — falling back to subprocess",
                                 device.device_id)
                 else:
-                    # Start the thinking ticker; voice_loop returns.
                     if device.inbox_ticker_task and not device.inbox_ticker_task.done():
                         device.inbox_ticker_task.cancel()
                     device.inbox_ticker_task = asyncio.create_task(
                         _inbox_thinking_ticker(hub, device, transcript)
                     )
-                    log.info("[voice-t] %s handed off to adapter at +%.0fms",
+                    log.info("[voice-t] %s posted to inbox at +%.0fms",
                              device.device_id, (time.time()-t0)*1000)
-                    return
+                    # Wait for the adapter to call /say (HERMES_INBOX_REPLY_TIMEOUT_S
+                    # cap matches the ticker's bail-out so they fail together).
+                    try:
+                        await asyncio.wait_for(device.reply_landed_evt.wait(),
+                                               timeout=HERMES_INBOX_REPLY_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        log.warning("[voice] %s no /say after %.0fs — ending loop",
+                                    device.device_id, HERMES_INBOX_REPLY_TIMEOUT_S)
+                        device.inbox_pending = False
+                        if device.inbox_ticker_task and not device.inbox_ticker_task.done():
+                            device.inbox_ticker_task.cancel()
+                        return
+                    # Wait for the device speaker to drain. tts_done_evt
+                    # fires when the device sends the `tts.done` WS event.
+                    # Cap generously — long replies (multi-paragraph
+                    # poetry, dance scripts) can run 60-90 s of audio.
+                    try:
+                        await asyncio.wait_for(device.tts_done_evt.wait(),
+                                               timeout=HERMES_INBOX_TTS_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        log.warning("[voice] %s tts.done not received in %.0fs — continuing anyway",
+                                    device.device_id, HERMES_INBOX_TTS_TIMEOUT_S)
+                    # Loop back to the top — next iteration captures the
+                    # follow-up turn with is_followup=True (5 s window
+                    # + "继续吗？" prompt). Empty → break the loop.
+                    continue
 
             # Phase 3b — legacy fallback: spawn `hermes chat -Q` and
             # synchronously wait for stdout. Used when channel mode is
@@ -1696,8 +1732,35 @@ async def _fire_motion(hub: Hub, device: Device, name: str) -> None:
         await hub.rpc(device, "do_action", {"name": name}, timeout=2.0)
 
 
+async def _play_tts_background(device: Device, text: str, *,
+                               sr: int, appid: str, token: str,
+                               speaker: str, speech_rate: float,
+                               loudness_rate: float) -> None:
+    """Nonblocking-mode TTS: stream Doubao chunks to the device in the
+    background so http_say can return immediately. voice_loop is the
+    one that waits for tts_done_evt before re-opening the mic.
+    """
+    tts_iter = doubao_tts_unidirectional.synthesize_stream(
+        text,
+        app_key=appid, access_key=token,
+        speaker=speaker,
+        sample_rate=sr,
+        audio_format="pcm",
+        speech_rate=speech_rate,
+        loudness_rate=loudness_rate,
+        uid=device.device_id,
+    )
+    try:
+        await stream_pcm_async(device, tts_iter, sr)
+    except Exception:
+        log.exception("[say-bg] %s streaming TTS failed", device.device_id)
+    finally:
+        with contextlib.suppress(Exception):
+            await tts_iter.aclose()
+
+
 async def http_say(req: web.Request) -> web.Response:
-    """POST /say {text, device?, voice?, sample_rate?, speaker?}
+    """POST /say {text, device?, voice?, sample_rate?, speaker?, nonblocking?}
     -> synthesize via Doubao TTS unidirectional (HTTP Chunked), pipe PCM
     straight to device as chunks arrive, return when stream ends.
 
@@ -1722,15 +1785,37 @@ async def http_say(req: web.Request) -> web.Response:
     # caller this turn — voice_loop will skip its own auto-TTS of
     # Hermes stdout to avoid double-speak.
     device.say_invoked_this_turn = True
-    # Channel mode: a /say call from the HotdogAdapter signals the
-    # agent's reply has landed, so stop the `思考中…` ticker.
-    if device.inbox_pending:
-        device.inbox_pending = False
-        if device.inbox_ticker_task and not device.inbox_ticker_task.done():
-            device.inbox_ticker_task.cancel()
-        log.info("[inbox] %s reply lands after %.1fs",
-                 device.device_id, time.time() - device.inbox_t0)
+    # `nonblocking=true` is the HotdogAdapter signal: this /say call
+    # carries the agent's text reply (as opposed to a `sc say "..."`
+    # skill call mid-loop, which is also TTS but not the *terminating*
+    # turn output). Only the adapter signal flips reply_landed_evt so
+    # voice_loop doesn't bail out of the wait early when a skill emits
+    # intermediate speech.
+    nonblocking = bool(body.get("nonblocking"))
+    if nonblocking:
+        if device.inbox_pending:
+            device.inbox_pending = False
+            if device.inbox_ticker_task and not device.inbox_ticker_task.done():
+                device.inbox_ticker_task.cancel()
+            log.info("[inbox] %s reply lands after %.1fs",
+                     device.device_id, time.time() - device.inbox_t0)
+        device.reply_landed_evt.set()
     sr = int(body.get("sample_rate", 16000))
+    if nonblocking and not body.get("legacy"):
+        appid, token = doubao_tts._load_creds()
+        tts_cfg = bridge_config.get_tts()
+        speaker = (body.get("speaker") or tts_cfg.speaker
+                   or doubao_tts_unidirectional.DEFAULT_SPEAKER)
+        asyncio.create_task(_play_tts_background(
+            device, text, sr=sr, appid=appid, token=token,
+            speaker=speaker, speech_rate=tts_cfg.speech_rate,
+            loudness_rate=tts_cfg.loudness_rate))
+        # Rough estimate: ~17 chars/s of Chinese audio so the caller
+        # can show a ticker / schedule a follow-up. Not used internally.
+        est_ms = int(len(text) / 17 * 1000)
+        return web.json_response({"ok": True, "device": device.device_id,
+                                  "queued": True, "chars": len(text),
+                                  "est_ms": est_ms, "mode": "nonblocking"})
     if body.get("legacy"):
         try:
             pcm = await doubao_tts.synthesize(text,

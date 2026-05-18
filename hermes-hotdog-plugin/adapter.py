@@ -99,10 +99,6 @@ class HotdogAdapter(BasePlatformAdapter):
         self.followup_s = float(_read_cfg(config, "followup_seconds", DEFAULT_FOLLOWUP_SECONDS))
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._inbox_runner: Optional[web.AppRunner] = None
-        # device_id (chat_id) → asyncio.Task currently running the follow-up
-        # mic listener. New replies cancel the previous follow-up so the
-        # user can interrupt the loop.
-        self._followup_tasks: Dict[str, asyncio.Task] = {}
 
     @property
     def name(self) -> str:
@@ -111,8 +107,12 @@ class HotdogAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ────────────────────────────────────────────── #
     async def connect(self) -> bool:
         # Reusable HTTP client for talking to bridge.
+        # Session-wide ceiling — per-request timeouts can be lower but
+        # not higher. Long replies (a multi-paragraph poem, a 100 s
+        # dance sequence) need /say to block for ~60-90 s; pick 240 s
+        # so we never trip this when bumping the per-call timeout below.
         self._http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120),
+            timeout=aiohttp.ClientTimeout(total=240),
             headers={"X-Hermes-Plugin": "hotdog-platform"},
         )
 
@@ -152,9 +152,6 @@ class HotdogAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
-        for task in list(self._followup_tasks.values()):
-            task.cancel()
-        self._followup_tasks.clear()
         if self._inbox_runner is not None:
             try:
                 await self._inbox_runner.cleanup()
@@ -186,12 +183,6 @@ class HotdogAdapter(BasePlatformAdapter):
                                      status=400)
         user_id   = str(body.get("user_id") or device_id)
         user_name = str(body.get("user_name") or "热狗用户")
-
-        # Cancel any pending follow-up: the user just spoke again, so the
-        # previous reply is no longer relevant.
-        prev = self._followup_tasks.pop(device_id, None)
-        if prev is not None and not prev.done():
-            prev.cancel()
 
         source = self.build_source(
             chat_id=device_id,
@@ -257,19 +248,20 @@ class HotdogAdapter(BasePlatformAdapter):
         # Strip simple markdown so TTS doesn't read "**bold**" literally.
         clean = self._strip_markdown(content.strip())
 
-        ok, err = await self._post_json("/say", {"device": chat_id, "text": clean})
+        # `/say` queues the reply into the bridge's TTS pipeline and
+        # returns immediately when `nonblocking` is set. The bridge's
+        # voice_loop is what owns the conversation rhythm: after the
+        # speaker drains it opens its own follow-up mic and re-POSTs to
+        # /inbox if the user speaks. That keeps the adapter stateless
+        # and means a long reply (60 s of TTS) never trips an HTTP
+        # timeout here, and the user can wait any length of time before
+        # speaking the next turn — same session picks up because
+        # chat_id == device_id.
+        ok, err = await self._post_json(
+            "/say", {"device": chat_id, "text": clean, "nonblocking": True}
+        )
         if not ok:
             return SendResult(success=False, error=err or "say_failed")
-
-        # Arm follow-up mic *after* TTS is done. bridge /say currently blocks
-        # until audio is fully drained (the tts_lock fix we landed today), so
-        # `clean` has been spoken when the POST returns. Now open a short
-        # mic window — if the user speaks again, ASR final POSTs to /inbox
-        # and lands as a fresh MessageEvent in the same session.
-        if self.followup_s > 0:
-            task = asyncio.create_task(self._followup_listen(chat_id))
-            self._followup_tasks[chat_id] = task
-
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -321,26 +313,9 @@ class HotdogAdapter(BasePlatformAdapter):
         return {"name": f"热狗 {chat_id}", "type": "dm", "chat_id": chat_id}
 
     # ── Helpers ─────────────────────────────────────────────────────────── #
-    async def _followup_listen(self, device_id: str) -> None:
-        """Open a follow-up mic on the bridge. Bridge will run streaming ASR
-        and call us back on /inbox if it captures anything; otherwise it
-        just times out and falls silent (no inbox call → no agent run)."""
-        try:
-            await asyncio.sleep(0.2)  # let speaker fully settle
-            await self._post_json(
-                "/listen",
-                {"device": device_id, "duration_s": self.followup_s,
-                 "forward_to_inbox": True},
-                timeout=self.followup_s + 8.0,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Hotdog: follow-up listen failed for %s", device_id)
-        finally:
-            # Clean up self-entry once we're done.
-            if self._followup_tasks.get(device_id) is asyncio.current_task():
-                self._followup_tasks.pop(device_id, None)
+    # Follow-up listen used to live here. It moved to the bridge so the
+    # adapter stays stateless — bridge's voice_loop now waits for
+    # tts.done after /say lands and opens its own follow-up mic.
 
     async def _post_json(
         self,
