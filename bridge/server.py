@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -230,15 +231,19 @@ class Device:
     # spoke via `sc say`, the bridge MUST NOT speak the stdout again
     # (double-speak: same content played twice on the device).
     say_invoked_this_turn: bool = False
-    # Hermes session id so consecutive voice turns share context. Set on
-    # the first _ask_hermes call (parsed from `hermes chat -Q -q ...`
-    # output), then passed back via `-r <id>` on subsequent turns until
-    # `hermes_session_idle_since` exceeds HERMES_SESSION_TTL_S — at
-    # which point we drop it and start a fresh session. SQLite still
-    # holds the old session; the user can browse / resume via
-    # `hermes sessions`.
+    # Hermes session id — used only when channel mode is off
+    # (BRIDGE_USE_HERMES_INBOX=0). In channel mode the gateway owns the
+    # session, keyed by chat_id == device_id, and we don't track it
+    # here. Kept for the legacy fallback path.
     hermes_session_id: str = ""
     hermes_session_idle_since: float = 0.0
+    # Channel-mode state. inbox_pending is True between "ASR final
+    # POSTed to /inbox" and "adapter called /say" — drives the
+    # `思考中…` ticker. inbox_ticker_task is the running ticker task,
+    # cancelled when /say lands or the timeout fires.
+    inbox_pending: bool = False
+    inbox_ticker_task: Any = None
+    inbox_t0: float = 0.0
 
     def next_sid(self) -> int:
         sid = self.sid_seq
@@ -276,11 +281,12 @@ class Hub:
         # device's old voice_loop keeps running 10+ s, calls Doubao TTS
         # for a reply nobody can hear, and races with the new connection's
         # voice_loop on the reconnect.
-        for attr in ("voice_task", "stream_task", "tracker"):
+        for attr in ("voice_task", "stream_task", "tracker", "inbox_ticker_task"):
             t = getattr(device, attr, None)
             if t is not None and not t.done():
                 t.cancel()
                 log.info("[hub] cancelled %s on %s", attr, device.device_id)
+        device.inbox_pending = False
         # Mark in-flight RPC futures as failed so any await on them
         # raises immediately instead of hanging until the 2 s timeout.
         for rpc_id, fut in list(device.pending.items()):
@@ -829,6 +835,21 @@ HERMES_SKILLS      = "hotdog"
 # stored session_id and starts fresh — keeps the context relevant
 # without bloating the prompt with stale history.
 HERMES_SESSION_TTL_S = 10 * 60.0
+
+# Channel-mode plumbing — see hermes-hotdog-plugin/adapter.py.
+# When BRIDGE_USE_HERMES_INBOX is on, voice_loop ends right after ASR
+# final by POSTing to the HotdogAdapter's local inbox listener. The
+# adapter then runs the agent in-process (no subprocess spin-up, full
+# Hermes session/mem0/skills) and calls back to bridge `/say` with the
+# reply. Set to "0" to fall back to the legacy `hermes chat -Q` path
+# (handy for offline debugging when the gateway is down).
+USE_HERMES_INBOX = os.environ.get("BRIDGE_USE_HERMES_INBOX", "1") == "1"
+HERMES_INBOX_URL = os.environ.get("BRIDGE_HERMES_INBOX_URL",
+                                  "http://127.0.0.1:8770/inbox")
+# After posting to /inbox we have no idea how long the agent will take.
+# This caps the "思考中…" screen — if no /say lands by then we show an
+# error and let the LCD auto-idle take over.
+HERMES_INBOX_REPLY_TIMEOUT_S = 60.0
 # Per-device dialog history cap fed back to Doubao as `context`. Volcengine
 # limit is ~800 tokens / 20 turns; 24 entries (≈12 round trips) is well inside
 # and matches the rule-of-thumb "remember the last few minutes of chat".
@@ -941,7 +962,38 @@ async def voice_loop(hub: Hub, device: Device) -> None:
                               {"title": "已听到 ✓", "text": transcript},
                               timeout=2.0)
 
-            # Phase 3b: HERMES with elapsed-seconds ticker so the user knows
+            # Phase 3b — channel mode: hand off to the HotdogAdapter.
+            # The adapter runs the agent in-process, calls back to
+            # `/say` with the reply, and arms its own follow-up
+            # listener. voice_loop's job ends here; the bridge's only
+            # remaining work this turn is to keep `思考中…` on screen
+            # until /say lands (see _inbox_thinking_ticker).
+            if USE_HERMES_INBOX:
+                device.inbox_pending = True
+                device.inbox_t0 = time.time()
+                ok = await _post_inbox(device, transcript)
+                if not ok:
+                    # Adapter unreachable — fall through to legacy
+                    # subprocess so the user still gets a reply (echo
+                    # mode is better than total silence).
+                    device.inbox_pending = False
+                    log.warning("[voice] %s inbox unreachable — falling back to subprocess",
+                                device.device_id)
+                else:
+                    # Start the thinking ticker; voice_loop returns.
+                    if device.inbox_ticker_task and not device.inbox_ticker_task.done():
+                        device.inbox_ticker_task.cancel()
+                    device.inbox_ticker_task = asyncio.create_task(
+                        _inbox_thinking_ticker(hub, device, transcript)
+                    )
+                    log.info("[voice-t] %s handed off to adapter at +%.0fms",
+                             device.device_id, (time.time()-t0)*1000)
+                    return
+
+            # Phase 3b — legacy fallback: spawn `hermes chat -Q` and
+            # synchronously wait for stdout. Used when channel mode is
+            # disabled (`BRIDGE_USE_HERMES_INBOX=0`) or the inbox POST
+            # failed.
             # we're still working (Hermes typically 10–30 s; without a ticker
             # the screen looks frozen and the user fires a new wake event).
             hermes_done = asyncio.Event()
@@ -1347,6 +1399,60 @@ def _strip_markdown_for_tts(text: str) -> str:
     return out.strip().strip("\uff0c,")
 
 
+async def _post_inbox(device: Device, text: str) -> bool:
+    """Channel mode: POST one ASR final to the HotdogAdapter's local
+    inbox listener (127.0.0.1:8770/inbox). Fire-and-forget — the agent
+    reply arrives async via the adapter calling our /say endpoint.
+
+    Returns True on 2xx, False otherwise; callers downgrade to the
+    legacy subprocess path if False.
+    """
+    body = {"device_id": device.device_id, "text": text}
+    try:
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(HERMES_INBOX_URL, json=body) as resp:
+                if resp.status >= 400:
+                    txt = (await resp.text())[:200]
+                    log.warning("[inbox] HTTP %d posting to %s: %s",
+                                resp.status, HERMES_INBOX_URL, txt)
+                    return False
+                with contextlib.suppress(Exception):
+                    await resp.read()
+                return True
+    except Exception as e:
+        log.warning("[inbox] post failed: %s", e)
+        return False
+
+
+async def _inbox_thinking_ticker(hub: Hub, device: Device, transcript: str) -> None:
+    """Channel mode: keep `思考中… Ns秒` on the LCD while we wait for the
+    adapter to call back via /say. Stops cleanly when `inbox_pending`
+    flips False (which http_say sets the moment a reply lands), or
+    after HERMES_INBOX_REPLY_TIMEOUT_S if the adapter never replies."""
+    start = time.time()
+    while device.inbox_pending:
+        elapsed = time.time() - start
+        if elapsed > HERMES_INBOX_REPLY_TIMEOUT_S:
+            log.warning("[inbox] %s no /say after %.0fs — giving up",
+                        device.device_id, elapsed)
+            device.inbox_pending = False
+            with contextlib.suppress(Exception):
+                await hub.rpc(device, "show_text",
+                              {"title": "agent 离线",
+                               "text": "请稍后重试或说 Hi WallE"},
+                              timeout=2.0)
+            asyncio.create_task(_set_led(hub, device, *LED_ERROR))
+            await asyncio.sleep(1.5)
+            asyncio.create_task(_set_led(hub, device, *LED_IDLE))
+            return
+        with contextlib.suppress(Exception):
+            await hub.rpc(device, "show_text",
+                          {"title": f"思考中… {int(elapsed)}秒",
+                           "text": transcript}, timeout=2.0)
+        await asyncio.sleep(2.0)
+
+
 async def _ask_hermes(text: str, device: Device | None = None) -> str:
     """Invoke Hermes with multi-turn session continuity per device.
 
@@ -1616,6 +1722,14 @@ async def http_say(req: web.Request) -> web.Response:
     # caller this turn — voice_loop will skip its own auto-TTS of
     # Hermes stdout to avoid double-speak.
     device.say_invoked_this_turn = True
+    # Channel mode: a /say call from the HotdogAdapter signals the
+    # agent's reply has landed, so stop the `思考中…` ticker.
+    if device.inbox_pending:
+        device.inbox_pending = False
+        if device.inbox_ticker_task and not device.inbox_ticker_task.done():
+            device.inbox_ticker_task.cancel()
+        log.info("[inbox] %s reply lands after %.1fs",
+                 device.device_id, time.time() - device.inbox_t0)
     sr = int(body.get("sample_rate", 16000))
     if body.get("legacy"):
         try:
@@ -1657,6 +1771,16 @@ async def http_say(req: web.Request) -> web.Response:
         # GC, so the httpx connection to openspeech is released right away.
         with contextlib.suppress(Exception):
             await tts_iter.aclose()
+    # Wait for the device to fully drain its speaker queue before
+    # returning. Without this, an immediate /listen follow-up from the
+    # HotdogAdapter opens the mic while ~1.5 s of bot audio is still
+    # playing — SenseVoice then ASRs the bot's own voice as a user turn.
+    # 2 s cap matches the old voice_loop guard.
+    try:
+        await asyncio.wait_for(device.tts_done_evt.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        log.warning("[say] %s tts.done not received in 2 s", device.device_id)
+    device.tts_active = False
     return web.json_response({"ok": True, "device": device.device_id,
                               "bytes": sent, "sample_rate": sr,
                               "mode": "streaming",
@@ -1752,12 +1876,46 @@ async def http_listen(req: web.Request) -> web.Response:
         dump_info = {"wav": path, "bytes": data_size, "rms": rms}
         log.info("[mic] dumped %d bytes to %s, rms=%d", data_size, path, rms)
 
+    # Channel mode: when the HotdogAdapter calls /listen with
+    # forward_to_inbox=True (e.g. as the follow-up mic after a reply),
+    # POST the captured transcript back to the adapter's /inbox in the
+    # background. The HTTP caller just gets `forwarded:true` and moves
+    # on — the inbox POST drives the next agent turn.
+    forwarded = False
+    fwd_text = (transcript or "").strip()
+    if body.get("forward_to_inbox") and fwd_text:
+        device.dialog_history.insert(0, f"用户: {fwd_text}")
+        del device.dialog_history[DIALOG_HISTORY_MAX:]
+        device.inbox_pending = True
+        device.inbox_t0 = time.time()
+        if device.inbox_ticker_task and not device.inbox_ticker_task.done():
+            device.inbox_ticker_task.cancel()
+        # Show 已听到 + thinking ticker just like voice_loop does after
+        # a wake-word capture — keeps the UX consistent across the two
+        # entry paths into the agent.
+        with contextlib.suppress(Exception):
+            await hub.rpc(device, "show_text",
+                          {"title": "已听到 ✓", "text": fwd_text},
+                          timeout=2.0)
+        asyncio.create_task(_set_led(hub, device, *LED_THINKING))
+        ok = await _post_inbox(device, fwd_text)
+        if ok:
+            device.inbox_ticker_task = asyncio.create_task(
+                _inbox_thinking_ticker(hub, device, fwd_text)
+            )
+            forwarded = True
+        else:
+            device.inbox_pending = False
+            log.warning("[listen] %s forward_to_inbox failed",
+                        device.device_id)
+
     return web.json_response({
         "ok": True, "device": device.device_id,
         "transcript": transcript,
         "partials": partials,
         "duration_s": duration,
         "dump": dump_info,
+        "forwarded": forwarded,
     })
 
 
