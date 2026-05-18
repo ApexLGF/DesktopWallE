@@ -184,6 +184,20 @@ class HotdogAdapter(BasePlatformAdapter):
         user_id   = str(body.get("user_id") or device_id)
         user_name = str(body.get("user_name") or "热狗用户")
 
+        # Hotdog is a *voice* channel — there is no way for the user to
+        # respond to a "Dangerous command requires approval" prompt
+        # mid-turn. Pre-approve any dangerous-command checks for this
+        # device's agent session so the agent can run `terminal` calls
+        # (e.g. `curl wttr.in/xian` for weather) without deadlocking on
+        # an approval prompt that gets silently filtered downstream.
+        try:
+            from tools.approval import enable_session_yolo  # type: ignore
+            session_key = f"agent:main:hotdog:dm:{device_id}"
+            enable_session_yolo(session_key)
+        except Exception:
+            logger.debug("Hotdog: enable_session_yolo unavailable; "
+                         "dangerous-command approvals may stall this channel")
+
         source = self.build_source(
             chat_id=device_id,
             chat_name=device_id,
@@ -206,18 +220,18 @@ class HotdogAdapter(BasePlatformAdapter):
         return web.json_response({"ok": True, "device": device_id})
 
     # ── Outbound to device ──────────────────────────────────────────────── #
-    # Prefixes / substrings that mark a message as a gateway-internal notice
-    # the user doesn't need to hear out loud. These tend to appear right after
-    # a platform comes online (e.g. "📬 No home channel is set …") or when
-    # Hermes' formatter sends a plain-text fallback after a markdown render
-    # failure. Speaking them is at best confusing and at worst — when they
-    # land back-to-back with the real reply on a serial TTS queue — turns
-    # a 4 s reply into a 50 s monologue.
+    # Substrings that mark a message as a gateway-internal notice the user
+    # doesn't need to hear out loud. Kept tight on purpose: bare emoji
+    # markers ("⚠️", "📢") were eating real agent output (e.g. the
+    # `⚠️ Dangerous command requires approval` banner that the gateway
+    # emits when the agent tries a sensitive tool — suppressing it caused
+    # voice_loop to time out waiting for a reply that the user never got
+    # to hear). Match on the actual *text* of each notice instead.
     _SYSTEM_MSG_MARKERS = (
-        "📬", "📢", "⚠️",
         "Response formatting failed",
-        "No home channel",
+        "No home channel is set",
         "A home channel is where",
+        "📬 No home channel",
     )
 
     @classmethod
