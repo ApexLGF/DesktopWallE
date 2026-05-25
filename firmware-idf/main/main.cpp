@@ -160,12 +160,18 @@ extern "C" void app_main(void) {
         // Threshold tuning history:
         //   0.63 — model default, tuned for clean AFE-processed audio.
         //          Never fires on our raw-mic pipeline.
-        //   0.40 — current. Compensates for our 75 dB raw gain + no AEC.
+        //   0.40 — Compensates for our 75 dB raw gain + no AEC.
         //          Earlier "false wakes from typing" turned out to be
         //          mis-classified Si12T touch events leaking through as
         //          taps, not WakeNet itself. With MIN_TAP_LEVEL=2 on the
-        //          touch driver, this threshold is safe to leave low.
-        wakenet->set_det_threshold(wn_model, 0.40f, 1);
+        //          touch driver, this threshold was safe to leave low.
+        //   0.50 — Bumped after user reported the desktop robot
+        //          self-waking with no one saying "Hi Wall-E". Still too
+        //          eager.
+        //   0.55 — current. Next notch. If still too eager, step to 0.60.
+        //          If the wake word itself stops registering, drop back
+        //          to 0.50 + consider enabling AFE pre-processing.
+        wakenet->set_det_threshold(wn_model, 0.55f, 1);
         float thr = wakenet->get_det_threshold(wn_model, 1);
         ESP_LOGI(TAG, "WakeNet: model=%s chunk=%d threshold=%.2f — \"Hi Wall-E\"",
                  wn_name, wn_chunk, thr);
