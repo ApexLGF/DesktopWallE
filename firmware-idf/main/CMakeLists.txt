@@ -4,6 +4,7 @@ idf_component_register(
                  "pmu.cpp"
                  "wifi_sta.cpp"
                  "bridge_ws.cpp"
+                 "audio_udp.cpp"
                  "lcd.cpp"
                  "speaker.cpp"
                  "led.cpp"

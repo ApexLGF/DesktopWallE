@@ -39,6 +39,7 @@
 #include "pmu.h"
 #include "wifi_sta.h"
 #include "bridge_ws.h"
+#include "audio_udp.h"
 #include "lcd.h"
 #include "speaker.h"
 #include "led.h"
@@ -239,6 +240,14 @@ extern "C" void app_main(void) {
     if (STACKPROXY_WS_HOST[0]) {
         bridge_ws_start(STACKPROXY_WS_HOST, STACKPROXY_WS_PORT,
                         device_id, boot_count, kFwVersion);
+        // Audio UDP sidecar — same host as bridge, fixed port 8768.
+        // The actual probe (KIND_UDP_HELLO) is kicked from bridge_ws
+        // when the ws hello.ack arrives — so the order here is: open
+        // socket + spawn worker tasks now; send first packet later
+        // once we know bridge is listening.
+        if (audio_udp_start(STACKPROXY_WS_HOST, 8768, device_id) != ESP_OK) {
+            ESP_LOGW(TAG, "audio_udp_start failed — mic stays on WS");
+        }
     } else {
         ESP_LOGW(TAG, "STACKPROXY_WS_HOST empty — running offline");
         lcd_set_state(LCD_STATE_ERROR);

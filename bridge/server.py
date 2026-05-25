@@ -32,6 +32,7 @@ from protocol import (
     decode_text, decode_binary, encode_binary, frame_req, frame_err, frame_pong,
     frame_hello_ack, frame_tts_start, frame_tts_end,
     KIND_MIC_PCM, KIND_TTS_PCM, KIND_TTS_OPUS, KIND_CAM_JPEG, KIND_DISP_IMG, KIND_DISP_RGB565,
+    KIND_UDP_HELLO, KIND_UDP_ACK, KIND_UDP_KA, PROTOCOL_VERSION, BINARY_HEADER_LEN,
 )
 import opuslib
 import struct
@@ -256,6 +257,16 @@ class Device:
     # nonblocking mode kicks off TTS in the background, so reply lands
     # well before TTS finishes playing.
     reply_landed_evt: asyncio.Event = field(default_factory=asyncio.Event)
+    # UDP audio sidecar state — populated when the device sends a
+    # KIND_UDP_HELLO datagram and bridge replies with KIND_UDP_ACK.
+    # `udp_addr` is the (ip, port) the device sent HELLO from — bridge
+    # sends TTS opus + UDP_KA + UDP_ACK back to this 5-tuple. While
+    # `udp_healthy` is True, mic_pcm frames are accepted from UDP and
+    # the device routes uplink there. False → fall back to WS path.
+    udp_addr: tuple | None = None
+    udp_healthy: bool = False
+    udp_last_rx_ts: float = 0.0
+    udp_mic_seq_last: int = -1   # monotonic gap detection on UDP path
 
     def next_sid(self) -> int:
         sid = self.sid_seq
@@ -2330,6 +2341,181 @@ def build_http_app(hub: Hub) -> web.Application:
 # main
 # =========================================================================
 
+# =========================================================================
+# UDP audio sidecar
+# =========================================================================
+#
+# Why a separate UDP channel instead of fixing the WS one:
+#   esp-websocket-client (espressif/esp-protocols v1.7.0, our installed
+#   version) treats *any* `transport_poll_write` timeout as a fatal
+#   connection error and forces a full reconnect — see the
+#   `esp_websocket_client_abort_connection(WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT)`
+#   call in esp_websocket_client.c after the `wlen < 0` branch. With a
+#   sustained 32 KB/s mic_pcm uplink on flaky WiFi we hit this every
+#   2-5 minutes, killing the in-flight voice turn.
+#
+#   We can't tune our way out (any timeout we pick → the lib still aborts
+#   on it). The fix is to take audio off TCP entirely. UDP has no
+#   head-of-line blocking — a dropped WiFi packet becomes a single
+#   dropped 32 ms frame instead of a multi-second send-buffer stall.
+#   ASR is statistically robust to one missing frame; Opus TTS has PLC.
+#
+# Negotiation (NAT-friendly, device-first):
+#   1. Device opens an ephemeral UDP socket at boot.
+#   2. After ws.hello.ack arrives, device sends KIND_UDP_HELLO to
+#      bridge:8768 with payload = device_id (UTF-8). The 8-byte header
+#      uses sid=0, seq=0.
+#   3. Bridge looks up device_id in Hub, records src_addr → Device.udp_addr,
+#      sends KIND_UDP_ACK to that src_addr, marks Device.udp_healthy=True.
+#   4. Device receives ACK, flips its own healthy flag, routes future
+#      mic_pcm sends to UDP instead of WS.
+#   5. If device sees no ACK in 5 s, it stays on the WS path — fully
+#      transparent fallback, never blocks the user.
+#   6. Both sides exchange KIND_UDP_KA every ~15 s while idle to keep
+#      NAT/firewall conntrack entries alive (no-op on flat LAN; matters
+#      if device and bridge ever end up on different VLANs / behind a
+#      home router NAT).
+#
+# Bridge dedupes by source-of-truth: a KIND_MIC_PCM frame can arrive on
+# either WS or UDP, but the device only sends on ONE at a time. We
+# append to the same device.mic_dump buffer either way; voice_loop is
+# transport-agnostic.
+
+class _UdpAudioProtocol(asyncio.DatagramProtocol):
+    """Receive-side handler for the audio sidecar UDP socket.
+
+    Holds a reference to the Hub so it can resolve device_id → Device
+    without an extra mapping. Sends responses through the same transport
+    (transport.sendto) so the 5-tuple matches what the device will see.
+    """
+
+    def __init__(self, hub: "Hub") -> None:
+        self._hub = hub
+        self._transport: asyncio.DatagramTransport | None = None
+
+    # asyncio API ----------------------------------------------------- #
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self._transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        if len(data) < BINARY_HEADER_LEN:
+            log.warning("[udp] short packet from %s: %d B", addr, len(data))
+            return
+        ver = data[0]
+        kind = data[1]
+        if ver != PROTOCOL_VERSION:
+            log.warning("[udp] %s bad ver 0x%02x", addr, ver)
+            return
+        payload = data[BINARY_HEADER_LEN:]
+        seq = int.from_bytes(data[4:8], "little")
+        if kind == KIND_UDP_HELLO:
+            self._handle_hello(addr, payload)
+        elif kind == KIND_UDP_KA:
+            self._handle_keepalive(addr)
+        elif kind == KIND_MIC_PCM:
+            self._handle_mic_pcm(addr, seq, payload)
+        else:
+            log.debug("[udp] %s unknown kind 0x%02x %d B", addr, kind, len(payload))
+
+    def error_received(self, exc: Exception) -> None:
+        log.warning("[udp] socket error: %s", exc)
+
+    # Internals ------------------------------------------------------- #
+    def _device_from_id(self, device_id: str) -> "Device | None":
+        return self._hub.devices.get(device_id)
+
+    def _device_from_addr(self, addr: tuple) -> "Device | None":
+        # Linear scan — device count is tiny in practice. Could index
+        # if it ever grows.
+        for d in self._hub.devices.values():
+            if d.udp_addr == addr:
+                return d
+        return None
+
+    def _send(self, kind: int, addr: tuple, payload: bytes = b"") -> None:
+        if self._transport is None:
+            return
+        header = bytes([PROTOCOL_VERSION, kind, 0, 0, 0, 0, 0, 0])
+        try:
+            self._transport.sendto(header + payload, addr)
+        except Exception as e:
+            log.warning("[udp] sendto %s kind=0x%02x failed: %s", addr, kind, e)
+
+    def _handle_hello(self, addr: tuple, payload: bytes) -> None:
+        try:
+            device_id = payload.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            log.warning("[udp] %s hello with non-UTF-8 device_id", addr)
+            return
+        device = self._device_from_id(device_id)
+        if device is None:
+            log.warning("[udp] %s hello for unknown device_id=%s — dropping",
+                        addr, device_id)
+            return
+        first_time = not device.udp_healthy or device.udp_addr != addr
+        device.udp_addr = addr
+        device.udp_healthy = True
+        device.udp_last_rx_ts = time.time()
+        device.udp_mic_seq_last = -1   # reset gap tracker for new path
+        self._send(KIND_UDP_ACK, addr)
+        if first_time:
+            log.info("[udp] hello from %s addr=%s — sent ack, audio path UDP",
+                     device_id, addr)
+
+    def _handle_keepalive(self, addr: tuple) -> None:
+        device = self._device_from_addr(addr)
+        if device is None:
+            # Could be a stale device that re-bound to a new ephemeral
+            # port. Silently drop — no security purpose to acking.
+            return
+        device.udp_last_rx_ts = time.time()
+        # Echo a keepalive back so the device can detect bridge liveness too.
+        self._send(KIND_UDP_KA, addr)
+
+    def _handle_mic_pcm(self, addr: tuple, seq: int, payload: bytes) -> None:
+        device = self._device_from_addr(addr)
+        if device is None:
+            log.warning("[udp] %s mic_pcm from unknown addr — drop", addr)
+            return
+        device.udp_last_rx_ts = time.time()
+        if device.mic_dump is None:
+            # Not currently capturing — bridge hasn't issued mic_start
+            # or capture already wrapped. Discard rather than buffer.
+            return
+        device.mic_dump.extend(payload)
+        # Cheap gap accounting (drop count) for diagnostic logging.
+        if device.udp_mic_seq_last >= 0:
+            gap = seq - device.udp_mic_seq_last - 1
+            if gap > 0 and (seq & 0xff) == 0:   # log every ~256 frames at most
+                log.info("[udp] %s mic_pcm cumulative gap +%d (seq=%u)",
+                         device.device_id, gap, seq)
+        device.udp_mic_seq_last = seq
+        if (seq & 0xf) == 0:
+            log.info("[udp] %s mic_pcm seq=%u acc=%d B",
+                     device.device_id, seq, len(device.mic_dump))
+
+
+async def _udp_health_sweeper(hub: "Hub") -> None:
+    """Mark devices unhealthy if their UDP path goes silent for >45 s.
+
+    Triggers fallback to the WS audio path for that device — we don't
+    actively kill the udp socket itself, just stop trusting it for the
+    affected device. Device-side keepalive (every 15 s) keeps the path
+    warm in normal operation; 3 missed keepalives → unhealthy.
+    """
+    while True:
+        try:
+            now = time.time()
+            for d in list(hub.devices.values()):
+                if d.udp_healthy and (now - d.udp_last_rx_ts) > 45:
+                    log.warning("[udp] %s silent for %.0fs — marking UDP unhealthy",
+                                d.device_id, now - d.udp_last_rx_ts)
+                    d.udp_healthy = False
+        except Exception:
+            log.exception("[udp] health sweeper error")
+        await asyncio.sleep(15)
+
+
 async def main_async(args: argparse.Namespace) -> None:
     hub = Hub()
 
@@ -2339,20 +2525,45 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             log.exception("[ws] handler crashed")
 
-    # Bump keepalive from the websockets-12 defaults (20 s interval, 20 s
-    # timeout). During a stream_pcm burst the device's audio task can starve
-    # the ws ping handler — we saw real 20 s ping timeouts ending sessions
-    # mid-utterance, then a "phantom" re-connect that looked like a stray
-    # wake event. 40 s/60 s is comfortable on a healthy LAN.
+    # WS keepalive history:
+    #   defaults (20s/20s) — too aggressive during stream_pcm bursts
+    #   40s/60s — fine when mic_pcm was on WS keeping the channel hot;
+    #             after UDP cutover (mic moved off WS), the WS became
+    #             mostly idle and we got "keepalive ping timeout"
+    #             ~30 min after each TTS burst (one ping right at end
+    #             of burst would lose its pong in TCP recovery, with
+    #             only one shot before 60 s timeout).
+    #   15s/60s — current. 4× faster pings means up to 4 missed
+    #             before the 60 s timeout, vs 1.5 before. Matches the
+    #             device side ping_interval_sec=10. Cheap on LAN.
     ws_server = await websockets.serve(_ws_entry, args.ws_host, args.ws_port,
                                        max_size=8 * 1024 * 1024,
-                                       ping_interval=40, ping_timeout=60)
+                                       ping_interval=15, ping_timeout=60)
     log.info("[ws] ocsc.v2 listening on %s:%d", args.ws_host, args.ws_port)
 
     runner = web.AppRunner(build_http_app(hub))
     await runner.setup()
     await web.TCPSite(runner, args.http_host, args.http_port).start()
     log.info("[http] admin listening on %s:%d", args.http_host, args.http_port)
+
+    # UDP audio sidecar — see the long header comment above _UdpAudioProtocol
+    # for design notes. Binds on the same host as the WS server so a
+    # device that can reach ws:8765 can also reach udp:8768. Failure to
+    # bind is non-fatal: the WS path keeps working, the device just
+    # never sees a UDP_ACK and stays on WS.
+    udp_port = 8768
+    udp_transport: asyncio.DatagramTransport | None = None
+    try:
+        loop = asyncio.get_running_loop()
+        udp_transport, _ = await loop.create_datagram_endpoint(
+            lambda: _UdpAudioProtocol(hub),
+            local_addr=(args.ws_host, udp_port),
+        )
+        log.info("[udp] audio sidecar listening on %s:%d", args.ws_host, udp_port)
+    except Exception as e:
+        log.warning("[udp] failed to bind %s:%d (%s) — WS-only audio",
+                    args.ws_host, udp_port, e)
+    asyncio.create_task(_udp_health_sweeper(hub))
 
     # Pre-render the listening screen so the first wake-event doesn't pay
     # the PIL render cost (would otherwise be a one-time ~300 ms hiccup).

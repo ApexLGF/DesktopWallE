@@ -25,6 +25,24 @@ KIND_CAM_JPEG = 0x03   # device -> bridge : JPEG capture result
 KIND_DISP_IMG = 0x04   # bridge -> device : JPEG to show full-screen
 KIND_DISP_RGB565 = 0x05  # bridge -> device : raw RGB565 LE 320x240 = 153600 B
 
+# UDP audio sidecar (0x80+). Same 8-byte header as the WS binary frames so
+# the parsing code is shared. Carried over UDP on bridge port 8768 instead
+# of the WS TCP socket — bypasses esp-websocket-client's
+# "transport_poll_write timeout → fatal abort" behaviour that costs us a
+# WS reconnect every few minutes during sustained mic streaming. UDP
+# avoids TCP head-of-line blocking: a single dropped WiFi packet becomes
+# a single dropped 32 ms audio frame instead of a multi-second TCP stall.
+#
+# Negotiation: device sends KIND_UDP_HELLO to bridge after ws.hello.ack
+# arrives. Bridge replies KIND_UDP_ACK to the src_addr it observed. If
+# device doesn't receive the ACK within 5 s, it stays on the WS audio
+# path (fallback). Either side periodically sends KIND_UDP_KA so NAT
+# / firewall conntrack stays warm. The bridge tags incoming MIC_PCM
+# datagrams by src_addr → device_id mapping built during HELLO.
+KIND_UDP_HELLO = 0x80  # device -> bridge : "I'm on this UDP port"
+KIND_UDP_ACK   = 0x81  # bridge -> device : "got it, audio over UDP is live"
+KIND_UDP_KA    = 0x82  # either way      : NAT/firewall keepalive (empty payload)
+
 # 8-byte header: ver(1) + kind(1) + sid(uint16 LE) + seq(uint32 LE)
 BINARY_HEADER_FMT = "<BBHI"
 BINARY_HEADER_LEN = struct.calcsize(BINARY_HEADER_FMT)  # 8

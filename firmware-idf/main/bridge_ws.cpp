@@ -20,6 +20,7 @@
 #include "led.h"
 #include "servo.h"
 #include "pmu.h"
+#include "audio_udp.h"
 #include "esp_system.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -487,6 +488,12 @@ void on_text(const char *data, size_t len) {
             g_hello_acked = true;
             lcd_set_state(LCD_STATE_IDLE);
             ESP_LOGI(TAG, "← hello.ack — bridge online (LCD=IDLE)");
+            // Kick the UDP audio sidecar probe now that we know bridge
+            // is alive. If the probe lands within 5 s, mic uplink
+            // switches to UDP before the user even speaks; if it
+            // doesn't, we silently stay on the WS path. Either way
+            // the user experience is identical from boot.
+            audio_udp_kick_probe();
         } else if (strcmp(t, "req") == 0) {
             handle_req(root);
         } else if (strcmp(t, "tts.start") == 0) {
@@ -668,8 +675,24 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     // WiFi roam) shouldn't make the user wait 5 s staring at the BRIDGE
     // screen. 1.5 s gets us back online before the user notices.
     cfg.reconnect_timeout_ms      = 1500;
-    cfg.network_timeout_ms        = 10000;
-    cfg.buffer_size               = 4096;    // OPUS packets are <200 B; this is plenty
+    // Bumped 10000 → 20000 (2026-05-24): a *single* transient WiFi
+    // stall during mic streaming was triggering esp-ws to give up and
+    // tear down the connection (see "transport_poll_write(0)" path).
+    // The user's wake-and-talk turn would get cancelled even though
+    // the link recovered ~100 ms later. With 20 s the WS layer waits
+    // through any realistic WiFi micro-stall before declaring death;
+    // the TCP keepalive (10+15 s, configured below) still catches a
+    // truly dead socket within ~25 s, so a real bridge/wifi failure
+    // doesn't get hidden.
+    cfg.network_timeout_ms        = 20000;
+    // Bumped 4096 → 16384 (2026-05-24): the lib's internal TX buffer
+    // is what absorbs short-term backpressure when mic_pcm (32 KB/s)
+    // races ahead of WiFi for a few hundred ms. With 4 KB headroom
+    // a single stalled poll_write filled the buffer and triggered
+    // the "returned 0, errno=0" tear-down. 16 KB ≈ 500 ms of mic
+    // streaming worth of cushion; still trivial vs. 8 MB SPIRAM
+    // and 512 KB internal SRAM.
+    cfg.buffer_size               = 16384;
     // Default 4 KB task stack overflows when we mix cJSON + send_bin
     // + event handler in the same task at 31 fps. 8 KB has comfortable
     // margin.
@@ -693,16 +716,20 @@ esp_err_t bridge_ws_start(const char *bridge_host, int bridge_port,
     cfg.keep_alive_interval       = 5;
     cfg.keep_alive_count          = 3;
     //
-    // Layer 2 — WS application-level ping every 30 s. NAT / AP idle
-    // timers in the path get traffic to keep the conduit alive.
-    // We DO leave pingpong-disconnect enabled now (different from the
-    // 2026-04 setting) but with a long 60 s pingpong_timeout — that
-    // tolerates a single missed pong on flaky WiFi without killing
-    // the connection, while still cutting cleanly if pongs stop
-    // entirely (which the TCP keep-alive should already catch faster).
+    // Layer 2 — WS application-level ping. After the audio sidecar
+    // moved mic_pcm to UDP (2026-05-25), the WS became a mostly-idle
+    // channel that only carries sparse RPCs + TTS opus bursts. A long
+    // 30 s ping interval was too sparse: after a 7-s TTS burst, the
+    // first post-burst ping sometimes never landed (TCP recovering
+    // from the burst, single pong lost in WiFi retransmits) and the
+    // 60 s pingpong_timeout fired → full WS disconnect ~1/30min.
+    //
+    // 10 s interval + 60 s timeout = up to 5 consecutive missed pings
+    // before we declare death. With healthy WiFi this is a per-10-s
+    // keep-warm packet against AP / switch session-table aging too.
     cfg.disable_pingpong_discon   = false;
     cfg.pingpong_timeout_sec      = 60;
-    cfg.ping_interval_sec         = 30;
+    cfg.ping_interval_sec         = 10;
     g_client = esp_websocket_client_init(&cfg);
     if (!g_client) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");
@@ -735,10 +762,41 @@ void bridge_ws_send_mic_pcm(const int16_t *samples, size_t n_samples) {
     buf[6] = (uint8_t)((g_mic_seq >> 16) & 0xFF);
     buf[7] = (uint8_t)((g_mic_seq >> 24) & 0xFF);
     memcpy(buf + BINARY_HEADER_LEN, samples, payload_bytes);
+    // ── UDP fast path ────────────────────────────────────────────────
+    // When the UDP audio sidecar is healthy, route mic frames there
+    // instead of the WS. This entirely sidesteps the
+    // `transport_poll_write` -> `abort_connection` death spiral we
+    // hit on the WS path during sustained streaming. Falls through to
+    // the WS send below if UDP isn't healthy (initial probe pending,
+    // or path went silent for >30 s and watchdog cleared the flag).
+    if (audio_udp_is_healthy()) {
+        if (audio_udp_send_mic_pcm(samples, n_samples, g_mic_sid, g_mic_seq)) {
+            if ((g_mic_seq & 0x3f) == 0) {
+                ESP_LOGI(TAG, "mic seq=%lu via UDP",
+                         (unsigned long)g_mic_seq);
+            }
+            ++g_mic_seq;
+            return;
+        }
+        // sendto failed despite healthy=true — drop this frame, the
+        // UDP watchdog will mark unhealthy if rx stops; meanwhile
+        // fall through to WS path so audio doesn't go silent.
+        ESP_LOGW(TAG, "mic seq=%lu udp send failed, falling back to ws",
+                 (unsigned long)g_mic_seq);
+    }
+    // Send timeout history (WS fallback path):
+    //   1000 ms — original.
+    //    300 ms — 2026-05-24 attempt to "drop fast, don't block".
+    //             BACKFIRED: lib treats poll_write timeout as fatal
+    //             connection error → forced reconnect.
+    //   2000 ms — 2026-05-24 revert + headroom. Still triggers
+    //             occasional disconnects but rarer than 300 ms.
+    //             Real fix is the UDP path above; this is fallback only.
     int sent = esp_websocket_client_send_bin(
-        g_client, (const char *)buf, total, pdMS_TO_TICKS(1000));
+        g_client, (const char *)buf, total, pdMS_TO_TICKS(2000));
     if (sent < 0) {
-        ESP_LOGW(TAG, "send_bin seq=%lu failed (%d) — dropping",
+        ESP_LOGW(TAG, "send_bin seq=%lu failed (%d) — dropping frame, "
+                      "ws state will recover on its own",
                  (unsigned long)g_mic_seq, sent);
         return;
     }
