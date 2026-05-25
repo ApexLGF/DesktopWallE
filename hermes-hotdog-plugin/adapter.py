@@ -54,6 +54,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    resolve_channel_prompt,
 )
 from gateway.config import PlatformConfig, Platform
 
@@ -205,12 +206,27 @@ class HotdogAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
         )
+        # Per-device ephemeral system prompt, sourced from config.yaml
+        # `hotdog.channel_prompts.<device_id>` (Hermes' generic
+        # platform-config bridge copies that block into self.config.extra
+        # because hotdog is registered as a plugin platform). Used to
+        # keep replies short + oral-friendly for the voice channel
+        # without changing the global model identity.
+        #
+        # Pass "default" as parent_id so `resolve_channel_prompt` falls
+        # back to a `channel_prompts.default` entry when no per-device
+        # override exists — every physical hotdog gets the robot
+        # persona without needing to list each MAC explicitly.
+        channel_prompt = resolve_channel_prompt(
+            self.config.extra, device_id, "default",
+        )
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=str(int(time.time() * 1000)),
             timestamp=__import__("datetime").datetime.now(),
+            channel_prompt=channel_prompt,
         )
         try:
             await self.handle_message(event)

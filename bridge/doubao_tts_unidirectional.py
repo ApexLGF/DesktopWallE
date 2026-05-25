@@ -44,12 +44,15 @@ log = logging.getLogger("doubao_tts_uni")
 URL          = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 RESOURCE_ID  = "volc.service_type.10029"
 
-# Default speaker — 京腔侃爷 (a Beijing-accented male voice). Overridable
-# via bridge/config.toml `[tts] speaker = "..."` without editing this file.
+# Default speaker — 少年梓辛 (a young, bright male voice — fits a small
+# desktop companion robot better than the previous 京腔侃爷 default).
+# Overridable via bridge/config.toml `[tts] speaker = "..."` without
+# editing this file.
 #
 # Speakers verified working on the volc.service_type.10029 (TTS 1.0)
 # resource that ships with the default Volcengine speech key:
-#   zh_male_jingqiangkanye_moon_bigtts   京腔侃爷·月    (male, default)
+#   zh_male_shaonianzixin_moon_bigtts    少年梓辛·月    (male, default)
+#   zh_male_jingqiangkanye_moon_bigtts   京腔侃爷·月    (male, Beijing accent)
 #   zh_female_shuangkuaisisi_moon_bigtts 爽快思思·月    (female, fast/emo)
 #   zh_female_qingxinnvsheng_mars_bigtts 清新女声·火    (female, calm)
 #   zh_female_kailangjiejie_moon_bigtts  开朗姐姐·月    (female, cheerful)
@@ -57,7 +60,7 @@ RESOURCE_ID  = "volc.service_type.10029"
 # 2.0 voices (云舟 2.0 = zh_male_m191_uranus_bigtts, plus other _uranus_
 # speakers) require activating 「豆包语音合成大模型 2.0」 on the
 # Volcengine console first, plus a different RESOURCE_ID — see TODO below.
-DEFAULT_SPEAKER = "zh_male_jingqiangkanye_moon_bigtts"
+DEFAULT_SPEAKER = "zh_male_shaonianzixin_moon_bigtts"
 
 
 @dataclass

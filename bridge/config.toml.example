@@ -57,10 +57,11 @@ openclaw_url = ""   # e.g. http://127.0.0.1:18789/api/gateway/stackproxy.invoke
 
 
 # TTS knobs (optional — leave `speaker` empty to use the code default
-# `zh_male_jingqiangkanye_moon_bigtts` / 京腔侃爷).
+# `zh_male_shaonianzixin_moon_bigtts` / 少年梓辛).
 #
 # Speakers verified working on the default volc.service_type.10029 resource:
-#   zh_male_jingqiangkanye_moon_bigtts   京腔侃爷·月    (male, default)
+#   zh_male_shaonianzixin_moon_bigtts    少年梓辛·月    (male, default)
+#   zh_male_jingqiangkanye_moon_bigtts   京腔侃爷·月    (male, Beijing accent)
 #   zh_female_shuangkuaisisi_moon_bigtts 爽快思思·月    (female, fast/emo)
 #   zh_female_qingxinnvsheng_mars_bigtts 清新女声·火    (female, calm)
 #   zh_female_kailangjiejie_moon_bigtts  开朗姐姐·月    (female, cheerful)
