@@ -23,6 +23,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_ili9341.h"
+#include "jpeg_decoder.h"
 
 static const char *TAG = "lcd";
 
@@ -632,4 +633,67 @@ void lcd_arm_idle_in(uint32_t delay_ms) {
     }
     esp_timer_stop(g_idle_timer);  // restart if already pending
     esp_timer_start_once(g_idle_timer, (uint64_t)delay_ms * 1000);
+}
+
+esp_err_t lcd_show_rgb565(const uint8_t *bytes, size_t len) {
+    if (!g_panel || !g_fb) return ESP_FAIL;
+    const size_t expected = (size_t)W * H * 2;
+    if (len != expected) {
+        ESP_LOGW(TAG, "rgb565 size mismatch: got %u, want %u",
+                 (unsigned)len, (unsigned)expected);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    // Bridge ships RGB565 little-endian (PIL's native byte order). Our
+    // framebuffer feeds the panel byte-swapped — see rgb565() at the top
+    // of this file. memcpy + per-pixel swap; unrolled because 76800
+    // iterations on PSRAM @240 MHz benefit measurably from avoiding the
+    // loop-counter overhead.
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(bytes);
+    for (int i = 0; i < W * H; ++i) {
+        uint16_t v = src[i];
+        g_fb[i] = static_cast<uint16_t>((v >> 8) | (v << 8));
+    }
+    // Bitmap overrides whatever state painter was queued. Use FACE state
+    // since it's already the "free-form pixels, no auto-IDLE flip" bucket;
+    // idle_timer_cb only auto-flips from SPEAKING/HEARD/ASR/ASR_ERR.
+    g_state = LCD_STATE_FACE;
+    g_think_elapsed = -1;
+    if (g_idle_timer) esp_timer_stop(g_idle_timer);
+    esp_err_t pe = draw_fb_banded();
+    ESP_LOGI(TAG, "disp.rgb565 %u B paint=%s", (unsigned)len, esp_err_to_name(pe));
+    return pe;
+}
+
+esp_err_t lcd_show_jpeg(const uint8_t *jpeg_data, size_t len) {
+    if (!g_panel || !g_fb) return ESP_FAIL;
+    if (!jpeg_data || len < 4) return ESP_ERR_INVALID_ARG;
+    // Bridge already letterboxes to 320×240 before shipping, but a
+    // smaller image would leave the area outside the decoded rect with
+    // stale fb bytes. Clear to black so the letterbox is well-defined.
+    memset(g_fb, 0, (size_t)W * H * 2);
+    esp_jpeg_image_cfg_t cfg = {};
+    cfg.indata               = const_cast<uint8_t *>(jpeg_data);
+    cfg.indata_size          = len;
+    cfg.outbuf               = reinterpret_cast<uint8_t *>(g_fb);
+    cfg.outbuf_size          = (size_t)W * H * 2;
+    cfg.out_format           = JPEG_IMAGE_FORMAT_RGB565;
+    cfg.out_scale            = JPEG_IMAGE_SCALE_0;
+    cfg.flags.swap_color_bytes = 1;   // emit BE so we don't post-process
+    esp_jpeg_image_output_t out = {};
+    uint32_t t0 = esp_log_timestamp();
+    esp_err_t err = esp_jpeg_decode(&cfg, &out);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "jpeg decode failed: %s (in=%u B)",
+                 esp_err_to_name(err), (unsigned)len);
+        return err;
+    }
+    uint32_t dec_ms = esp_log_timestamp() - t0;
+    g_state = LCD_STATE_FACE;
+    g_think_elapsed = -1;
+    if (g_idle_timer) esp_timer_stop(g_idle_timer);
+    esp_err_t pe = draw_fb_banded();
+    ESP_LOGI(TAG, "disp.jpeg %ux%u decoded %u B in %u ms paint=%s",
+             (unsigned)out.width, (unsigned)out.height,
+             (unsigned)len, (unsigned)dec_ms, esp_err_to_name(pe));
+    return pe;
 }

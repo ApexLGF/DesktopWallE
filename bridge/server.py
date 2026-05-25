@@ -216,6 +216,12 @@ class Device:
     # the user has stopped talking. Device-side VADNet (firmware-idf)
     # fires this with reason="vad" + ~1 s trailing silence latency.
     mic_end_evt: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reason string from the most recent device mic.end frame. "vad" means
+    # the firmware's neural VAD detected real speech (g_saw_speech latch
+    # required ≥1.28 s cumulative SPEECH frames OR a fresh SILENCE→SPEECH
+    # edge during streaming). When set, bridge trusts it over the local
+    # RMS pre-check and runs ASR even if RMS never crossed threshold.
+    mic_end_reason: str = ""
     # Rolling dialog history fed back to Doubao ASR as `context_type=dialog_ctx`
     # so consecutive turns benefit from earlier-turn vocabulary / names /
     # references. Ordered newest-first (per Volcengine spec). Capped to
@@ -475,6 +481,7 @@ async def handle_text(hub: Hub, device: Device, raw: str) -> None:
         # Device-side VAD says the user stopped talking. Wake any
         # _capture_utterance waiting on this device so it doesn't have
         # to fall back to its slower bridge-side RMS detector.
+        device.mic_end_reason = str(msg.get("reason") or "")
         device.mic_end_evt.set()
         log.info("[%s] mic.end sid=%s reason=%s total=%s",
                  device.device_id, msg.get("sid"), msg.get("reason"),
@@ -1159,6 +1166,17 @@ async def voice_loop(hub: Hub, device: Device) -> None:
 async def _voice_cleanup(hub: Hub, device: Device) -> None:
     await asyncio.sleep(0.4)
     asyncio.create_task(_set_led(hub, device, *LED_IDLE))
+    # The IDF firmware doesn't render bridge-side JPEG/RGB565 frames yet;
+    # KIND_DISP_IMG is silently dropped. The only reliable way to push the
+    # LCD back to IDLE is the show_text title-pattern dispatcher
+    # (bridge_ws.cpp lines 165-222). "没听到" maps to LCD_STATE_IDLE
+    # immediately, instead of letting the firmware's 15 s ASR auto-idle
+    # timer expire — that timer is what kept the screen stuck on "识别中"
+    # after a follow-up turn returned an empty transcript.
+    with contextlib.suppress(Exception):
+        await hub.rpc(device, "show_text",
+                      {"title": "没听到",
+                       "text": "说 Hi WallE 重试"}, timeout=2.0)
     with contextlib.suppress(Exception):
         await _ship_jpeg(device, screen.face_jpeg("idle"))
     with contextlib.suppress(Exception):
@@ -1204,6 +1222,7 @@ async def _capture_utterance(hub: Hub, device: Device,
     # --- 1. Start mic capture (NO Doubao session opened up-front any more).
     device.mic_dump = bytearray()
     device.mic_end_evt.clear()    # rearm — device may have left it set from prior turn
+    device.mic_end_reason = ""    # rearm — only the *current* turn's reason matters
     sid            = device.next_sid()
     device.asr_sid = sid
     try:
@@ -1305,10 +1324,14 @@ async def _capture_utterance(hub: Hub, device: Device,
                           {"title": "没听清",
                            "text": "请再说一次"}, timeout=2.0)
         return ""
-    # Local RMS detector never saw voice — no point spending ¥ asking
-    # Doubao to transcribe silence. Treat as empty result; voice_loop
-    # will route into its no-speech path (follow-up timeout / strike).
-    if first_voice_at == 0.0:
+    # Local RMS detector never saw voice. Two cases:
+    #   (a) device VAD also said nothing — true silence, skip ASR.
+    #   (b) device VAD reported reason="vad" — the neural model trusts
+    #       there was speech even though raw RMS stayed under our crude
+    #       1000 threshold (happens with soft voice, far-field, or
+    #       low post-TTS gain). Trust the device — SenseVoice is local
+    #       and free, so it costs nothing to let ASR adjudicate.
+    if first_voice_at == 0.0 and device.mic_end_reason != "vad":
         log.info("[voice] no voice in %d bytes (%.1f s) — skipping ASR call",
                  pcm_len, pcm_len / 32000)
         with contextlib.suppress(Exception):
@@ -1316,6 +1339,10 @@ async def _capture_utterance(hub: Hub, device: Device,
                           {"title": "没听到",
                            "text": "请讲，我在听…"}, timeout=2.0)
         return ""
+    if first_voice_at == 0.0:
+        log.info("[voice] bridge RMS quiet but device VAD said reason=vad "
+                 "(%d bytes, %.1f s) — running ASR anyway",
+                 pcm_len, pcm_len / 32000)
 
     # --- 3. Flash ASR with elapsed-seconds ticker.
     log.info("[voice] capture %d bytes (%.1f s) → flash asr",
@@ -1639,16 +1666,28 @@ async def http_show_text2(req: web.Request) -> web.Response:
     bg = tuple(body.get("bg") or screen.BG_DEFAULT)
     fg = tuple(body.get("fg") or screen.FG_DEFAULT)
     size = body.get("size", "auto")
+    # Default transport is JPEG (~5-10 KB) — it's fastest over WiFi for
+    # text cards. `transport=rgb565` ships the raw 320×240×2 = 153.6 KB
+    # framebuffer instead, useful for diagnosing JPEG decoder issues on
+    # the device or when crisp glyph edges matter (chroma subsampling in
+    # JPEG smears thin Chinese strokes).
+    transport = (body.get("transport") or "jpeg").lower()
     try:
         img = screen.render_text(text, title=title, face=face,
                                  bg=bg, fg=fg, size=size)
-        jpeg = screen.to_jpeg(img, quality=80)
+        if transport == "rgb565":
+            payload = screen.to_rgb565(img)
+        else:
+            payload = screen.to_jpeg(img, quality=80)
     except Exception as e:
         return web.json_response({"ok": False, "error": f"render: {e}"}, status=500)
     with contextlib.suppress(Exception):
-        await _ship_jpeg(device, jpeg)
+        if transport == "rgb565":
+            await _ship_rgb565(device, payload)
+        else:
+            await _ship_jpeg(device, payload)
     return web.json_response({"ok": True, "device": device.device_id,
-                              "bytes": len(jpeg)})
+                              "bytes": len(payload), "transport": transport})
 
 
 async def http_perform(req: web.Request) -> web.Response:
@@ -1830,7 +1869,18 @@ async def http_say(req: web.Request) -> web.Response:
                      device.device_id, time.time() - device.inbox_t0)
         device.reply_landed_evt.set()
     sr = int(body.get("sample_rate", 16000))
-    if nonblocking and not body.get("legacy"):
+    # Hermes (via HotdogAdapter) is the only caller that sets nonblocking,
+    # and PCM-direct streaming (KIND_TTS_PCM) stutters on the device whenever
+    # WiFi jitters — a 32 KB/s raw stream with no per-packet redundancy
+    # starves the speaker DMA. Opus packets are 30-60 B/frame and absorb
+    # the same jitter cleanly. So: nonblocking ALWAYS goes Opus, even if a
+    # caller accidentally passes `legacy=true` alongside. The explicit
+    # `legacy=true` PCM path below is reserved for blocking A/B test calls
+    # (e.g. `curl /say -d '{"text":"...","legacy":true}'`).
+    if nonblocking:
+        if body.get("legacy"):
+            log.warning("[say] %s nonblocking=true overrides legacy=true — "
+                        "forcing Opus path", device.device_id)
         appid, token = doubao_tts._load_creds()
         tts_cfg = bridge_config.get_tts()
         speaker = (body.get("speaker") or tts_cfg.speaker
@@ -2337,12 +2387,11 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    # Bump the websockets server logger to DEBUG so close-frame
-    # exchanges, pings, and protocol errors show up in bridge.log.
-    # This is what we need to diagnose mysterious "hub unregistered"
-    # events that fire mid-TTS — the close-code/reason gets logged
-    # by the lib only at DEBUG level.
-    logging.getLogger("websockets.server").setLevel(logging.DEBUG)
+    # Keep the websockets server logger at WARNING — its DEBUG stream
+    # logs every binary frame which floods bridge.log during mic/tts
+    # streaming. Temporarily bump to DEBUG only when diagnosing
+    # close-frame / ping issues.
+    logging.getLogger("websockets.server").setLevel(logging.WARNING)
     _effective_speaker = cfg.tts.speaker or doubao_tts_unidirectional.DEFAULT_SPEAKER
     log.info("config: doubao=ok ws=%s:%d http=%s:%d tts.speaker=%s source=%s",
              args.ws_host, args.ws_port, args.http_host, args.http_port,

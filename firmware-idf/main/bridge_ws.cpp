@@ -32,9 +32,12 @@ namespace {
 
 // Match bridge/protocol.py exactly.
 constexpr uint8_t PROTOCOL_VERSION = 0x02;
-constexpr uint8_t KIND_MIC_PCM     = 0x01;
-constexpr uint8_t KIND_TTS_PCM     = 0x02;
-constexpr uint8_t KIND_TTS_OPUS    = 0x06;
+constexpr uint8_t KIND_MIC_PCM      = 0x01;  // device → bridge : mic PCM16LE
+constexpr uint8_t KIND_TTS_PCM      = 0x02;  // bridge → device : TTS PCM16LE
+constexpr uint8_t KIND_CAM_JPEG     = 0x03;  // device → bridge : camera JPEG (not impl)
+constexpr uint8_t KIND_DISP_IMG     = 0x04;  // bridge → device : full-screen JPEG
+constexpr uint8_t KIND_DISP_RGB565  = 0x05;  // bridge → device : 320×240 RGB565 LE = 153600 B
+constexpr uint8_t KIND_TTS_OPUS     = 0x06;  // bridge → device : TTS Opus frame (60 ms)
 
 constexpr size_t BINARY_HEADER_LEN = 8;
 // 8 bytes: u8 ver, u8 kind, u16 sid LE, u32 seq LE
@@ -154,6 +157,17 @@ void handle_req(cJSON *root) {
         } else {
             ESP_LOGI(TAG, "mic streaming off (LCD=ASR, IDLE in 15s)");
         }
+    } else if (strcmp(method, "tts_stop") == 0) {
+        // Bridge calls this when a wake/tap interrupts an in-flight TTS.
+        // Drain both queues immediately so the speaker_task stops pulling
+        // more chunks; the codec's 240 ms DMA cushion still plays out
+        // whatever's already on the wire. Without this RPC handler the
+        // bridge's cancel only stops new opus frames from being sent,
+        // while everything already queued on the device keeps playing
+        // (~1-3 s of audio in flight on a long reply).
+        speaker_stop();
+        send_res_ok(rpc_id, nullptr);
+        ESP_LOGI(TAG, "tts_stop: queues drained");
     } else if (strcmp(method, "show_text") == 0) {
         // Bridge sends rich text we don't fully render yet — peek at the
         // title to infer agent state and update the LCD color accordingly.
@@ -510,6 +524,29 @@ void on_binary(const uint8_t *data, size_t len) {
         ESP_LOGW(TAG, "binary frame ver mismatch: 0x%02x", ver);
         return;
     }
+    size_t payload_bytes = len - BINARY_HEADER_LEN;
+    if (payload_bytes < 1) {
+        ESP_LOGW(TAG, "binary frame bad payload: %u bytes", (unsigned)payload_bytes);
+        return;
+    }
+    // Display frames: full-screen image push from bridge. Handled inline
+    // (no seq tracking — single-frame paint, not a stream).
+    if (kind == KIND_DISP_IMG) {
+        esp_err_t err = lcd_show_jpeg(data + BINARY_HEADER_LEN, payload_bytes);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "disp.jpeg %u B → lcd_show_jpeg: %s",
+                     (unsigned)payload_bytes, esp_err_to_name(err));
+        }
+        return;
+    }
+    if (kind == KIND_DISP_RGB565) {
+        esp_err_t err = lcd_show_rgb565(data + BINARY_HEADER_LEN, payload_bytes);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "disp.rgb565 %u B → lcd_show_rgb565: %s",
+                     (unsigned)payload_bytes, esp_err_to_name(err));
+        }
+        return;
+    }
     if (kind != KIND_TTS_PCM && kind != KIND_TTS_OPUS) {
         ESP_LOGW(TAG, "binary frame unknown kind: 0x%02x", kind);
         return;
@@ -518,11 +555,6 @@ void on_binary(const uint8_t *data, size_t len) {
                  | ((uint32_t)data[5] << 8)
                  | ((uint32_t)data[6] << 16)
                  | ((uint32_t)data[7] << 24);
-    size_t payload_bytes = len - BINARY_HEADER_LEN;
-    if (payload_bytes < 1) {
-        ESP_LOGW(TAG, "tts pcm bad payload: %u bytes", (unsigned)payload_bytes);
-        return;
-    }
     if (kind == KIND_TTS_OPUS) {
         speaker_play_opus(data + BINARY_HEADER_LEN, payload_bytes, (uint16_t)seq);
     } else {
@@ -565,18 +597,35 @@ void ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_da
         // means there's more coming for this frame. We reassemble here
         // before handing off to on_binary, which expects a complete frame
         // with the 8-byte header at offset 0.
-        static uint8_t  reasm[8192];   // covers tts_pcm (1928 B), set_image (large), opus (~70 B)
+        //
+        // Buffer sized to fit the largest expected payload: KIND_DISP_RGB565
+        // is 320×240×2 + 8 B header ≈ 154 KB. PSRAM-allocated lazily so we
+        // don't pay 160 KB of internal RAM even on devices that never receive
+        // a bitmap frame.
+        constexpr size_t REASM_CAP = 160 * 1024;
+        static uint8_t *reasm = nullptr;
         static size_t   reasm_filled = 0;
         if (data->op_code == 0x01 /* text */ && data->data_len > 0) {
             on_text((const char *)data->data_ptr, data->data_len);
         } else if (data->op_code == 0x02 /* binary */ && data->data_len > 0) {
+            if (!reasm) {
+                reasm = (uint8_t *)heap_caps_malloc(REASM_CAP,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!reasm) {
+                    ESP_LOGE(TAG, "reasm PSRAM alloc %u failed — binary frame dropped",
+                             (unsigned)REASM_CAP);
+                    break;
+                }
+                ESP_LOGI(TAG, "reasm buffer allocated in PSRAM (%u B)",
+                         (unsigned)REASM_CAP);
+            }
             if (data->payload_offset == 0) reasm_filled = 0;
-            if (reasm_filled + data->data_len <= sizeof(reasm)) {
+            if (reasm_filled + data->data_len <= REASM_CAP) {
                 memcpy(reasm + reasm_filled, data->data_ptr, data->data_len);
                 reasm_filled += data->data_len;
             } else {
                 ESP_LOGW(TAG, "ws reasm overflow: filled=%u + %d > %u — frame discarded",
-                         (unsigned)reasm_filled, data->data_len, (unsigned)sizeof(reasm));
+                         (unsigned)reasm_filled, data->data_len, (unsigned)REASM_CAP);
                 reasm_filled = 0;
                 break;
             }

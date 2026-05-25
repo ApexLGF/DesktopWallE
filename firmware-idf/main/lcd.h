@@ -54,6 +54,20 @@ void      lcd_arm_idle_in(uint32_t delay_ms);
 void      lcd_face_set(const char *expression,
                        uint32_t eye_rgb, uint32_t mouth_rgb, uint32_t bg_rgb);
 
+// Paint a full-screen 320×240 RGB565 bitmap on the panel. `bytes` is the
+// raw image in little-endian RGB565 order (low byte first) — the canonical
+// layout PIL emits and bridge ships via KIND_DISP_RGB565. We swap bytes on
+// the fly into the panel's BE framebuffer. `len` must equal 320×240×2 =
+// 153600. Cancels any pending auto-IDLE timer so the painted bitmap sticks.
+esp_err_t lcd_show_rgb565(const uint8_t *bytes, size_t len);
+
+// Decode a JPEG into the framebuffer and paint. Bridge letterboxes images
+// to 320×240 q=80 before shipping (see `_fit_to_display` in server.py).
+// `len` is the JPEG byte count. Uses esp_jpeg (managed component) with
+// RGB565 output + byte-swap so we land directly on the panel format.
+// Cancels any pending auto-IDLE timer.
+esp_err_t lcd_show_jpeg(const uint8_t *jpeg_data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
